@@ -1293,6 +1293,7 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        draft_token_lengths = model_runner_output.draft_token_lengths
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1483,6 +1484,18 @@ class Scheduler(SchedulerInterface):
                     stopped_running_reqs.add(request)
                 else:
                     stopped_preempted_reqs.add(request)
+            elif (
+                draft_token_lengths is not None
+                and self.scheduler_config.async_scheduling
+            ):
+                # Async speculative scheduling normally installs a fixed
+                # placeholder list before the worker proposes the next draft.
+                # DSpark can produce a shorter confidence-scheduled prefix, so
+                # resize the placeholder list here for the next scheduler step.
+                draft_len = draft_token_lengths.get(req_id)
+                if draft_len is not None:
+                    draft_len = max(0, min(int(draft_len), self.num_spec_tokens))
+                    request.spec_token_ids = [-1] * draft_len
 
             # Extract sample logprobs if needed.
             if (

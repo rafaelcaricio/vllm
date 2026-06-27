@@ -185,6 +185,7 @@ if TYPE_CHECKING:
         "relax",
     ] = "relax"
     VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP: bool = True
+    VLLM_DSPARK_CONFIDENCE_THRESHOLD: str = "0.0"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_FP16: bool = False
@@ -1458,6 +1459,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "full",
             "relax",
         ],
+    ),
+    # Experimental DSpark confidence-scheduled verification threshold.
+    # Parsed and range-checked by DSparkProposer.
+    "VLLM_DSPARK_CONFIDENCE_THRESHOLD": lambda: os.getenv(
+        "VLLM_DSPARK_CONFIDENCE_THRESHOLD", "0.0"
     ),
     # Whether to use fused grouped_topk used for MoE expert selection.
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(

@@ -30,12 +30,18 @@ production branch.
   can skew the first verified decode step.
 - Draft tokens are selected greedily from DSpark logits. Sampling-temperature
   aware DSpark draft sampling from the reference code is not wired yet.
-- Confidence scores are collected into diagnostics, but confidence-based dynamic
-  prefix pruning is not yet used to shorten the draft list returned to vLLM.
-- Confidence diagnostics currently copy small tensors to CPU during draft
-  observation. This is useful while bringing the path up, but it should be
-  converted to an asynchronous or aggregated GPU-side path before production
-  benchmarking.
+- Confidence-scheduled verification has a first-pass static threshold knob
+  (`VLLM_DSPARK_CONFIDENCE_THRESHOLD`) that prunes each request to the longest
+  cumulative-survival prefix above the threshold before vLLM verification. This
+  is not yet the full hardware-aware dynamic scheduler from the paper.
+- Async scheduling now carries DSpark's per-request confidence prefix lengths
+  through `ModelRunnerOutput.draft_token_lengths` so the next speculative
+  placeholder list is variable length. This is a minimal bridge; it does not yet
+  use a scheduler cost model, bucketing, or GPU-side prefix selection.
+- Confidence diagnostics and prefix-length decisions currently copy small
+  tensors to CPU during draft observation. This is useful while bringing the
+  path up, but it should be converted to an asynchronous or aggregated GPU-side
+  path before production benchmarking.
 - Draft probabilities are not returned for probabilistic rejection sampling.
   The current path targets greedy single-stream benchmarking first.
 - DSpark's draft model is integrated as `method="dspark"` with first-pass
@@ -99,6 +105,18 @@ production branch.
   37.64 tokens/s with 10.02% CV. Mean accepted draft rate was 14.28% with
   24.03% CV, so acceptance/reference parity is a measured priority before
   treating fused-kernel-only work as the largest speed lever.
+- First-pass confidence scheduling is enabled in the Docker experiment with
+  `VLLM_DSPARK_CONFIDENCE_THRESHOLD=0.50`. Repeated real-model benchmarks are
+  still needed to determine whether this threshold improves single-stream
+  interactive decode speed or only raises acceptance rate by pruning too
+  aggressively.
+- Corrected async-bridge post-JIT profile on 2026-06-27 with threshold `0.50`
+  ran three salted single-stream repetitions. Mean server-counter decode speed
+  was 38.20 tokens/s with 41.76% CV, roughly matching the 37.64 tokens/s
+  fixed-length baseline but with much worse variance. Mean scheduled draft
+  tokens dropped from 5.00 to 3.59 per draft and mean accepted draft rate rose
+  from 14.28% to 30.06%. This proves pruning is active, but static threshold
+  `0.50` is not a clear speed win yet.
 
 ## Custom Kernel Opportunities
 
@@ -110,6 +128,14 @@ production branch.
   can separate target verification time, `prefill_main`/main-KV update time,
   draft sparse attention/projection time, Markov/logit selection time, and
   rejection sampling time.
+- TODO P0: run a threshold sweep over `VLLM_DSPARK_CONFIDENCE_THRESHOLD`
+  against the real model and record tok/s, scheduled length, prune rate,
+  accepted tokens, and acceptance by position. Compare static thresholding with
+  the paper's hardware-aware scheduler before promoting a default.
+- TODO P0: profile the variable-prefix async bridge overhead. The corrected
+  threshold `0.50` run reduced verified draft tokens but increased tok/s
+  variance, so measure scheduler placeholder updates, ragged metadata creation,
+  route packing, and rejection-sampling shape changes.
 - TODO P1: add warmup coverage for inference-time JIT gaps observed on the real
   server: request-prep metadata, route packing, EAGLE-named speculative prep,
   and rejection greedy sampling.

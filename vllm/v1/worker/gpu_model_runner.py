@@ -826,6 +826,8 @@ class GPUModelRunner(
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
+        self._draft_token_lengths_cpu: list[int] | None = None
+        self._draft_token_length_req_ids: list[str] | None = None
         self._draft_probs: torch.Tensor | None = None
         self._draft_prob_req_ids: list[str] | None = None
         # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
@@ -4381,6 +4383,8 @@ class GPUModelRunner(
                 )
 
         self._draft_token_ids = None
+        self._draft_token_lengths_cpu = None
+        self._draft_token_length_req_ids = None
         self._draft_probs = None
         self._draft_prob_req_ids = None
         self._draft_token_req_ids = None
@@ -4517,6 +4521,20 @@ class GPUModelRunner(
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        draft_token_lengths = None
+        if (
+            self.use_async_scheduling
+            and self._draft_token_lengths_cpu is not None
+            and self._draft_token_length_req_ids is not None
+        ):
+            draft_token_lengths = {
+                req_id: int(length)
+                for req_id, length in zip(
+                    self._draft_token_length_req_ids,
+                    self._draft_token_lengths_cpu,
+                    strict=True,
+                )
+            }
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
@@ -4532,6 +4550,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                draft_token_lengths=draft_token_lengths,
             )
 
         if not self.use_async_scheduling:
@@ -4688,7 +4707,17 @@ class GPUModelRunner(
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_cpu is not None
         self.draft_token_ids_event.synchronize()
-        return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
+        draft_token_ids = self.draft_token_ids_cpu[: len(req_ids)].tolist()
+        if self._draft_token_lengths_cpu is not None:
+            draft_token_ids = [
+                row[: max(0, min(len(row), int(length)))]
+                for row, length in zip(
+                    draft_token_ids,
+                    self._draft_token_lengths_cpu,
+                    strict=True,
+                )
+            ]
+        return draft_token_ids, req_ids
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
@@ -5028,6 +5057,15 @@ class GPUModelRunner(
                 if draft_probs is not None:
                     self._draft_probs = draft_probs
                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
+            if spec_config.use_dspark() and hasattr(
+                self.drafter, "take_last_draft_lengths"
+            ):
+                self._draft_token_lengths_cpu = self.drafter.take_last_draft_lengths()
+                self._draft_token_length_req_ids = (
+                    self.input_batch.req_ids.copy()
+                    if self._draft_token_lengths_cpu is not None
+                    else None
+                )
 
         return draft_token_ids
 

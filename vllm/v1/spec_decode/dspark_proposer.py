@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -17,6 +18,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.dspark import (
     DSparkDiagnostics,
+    confidence_threshold_prefix_length,
     make_dspark_warmup_draft_token_ids,
     score_prefix_lengths,
 )
@@ -75,6 +77,31 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self.diagnostics = DSparkDiagnostics(
             max_spec_tokens=self.num_speculative_tokens
         )
+        self.confidence_threshold = self._read_confidence_threshold()
+        self._last_draft_lengths: list[int] | None = None
+        if self.confidence_threshold > 0.0:
+            logger.info(
+                "DSpark confidence-scheduled verification enabled with "
+                "threshold %.4f.",
+                self.confidence_threshold,
+            )
+
+    @staticmethod
+    def _read_confidence_threshold() -> float:
+        raw = os.getenv("VLLM_DSPARK_CONFIDENCE_THRESHOLD", "0.0")
+        try:
+            threshold = float(raw)
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_DSPARK_CONFIDENCE_THRESHOLD must be a float in [0, 1], "
+                f"got {raw!r}"
+            ) from exc
+        if threshold < 0.0 or threshold > 1.0:
+            raise ValueError(
+                "VLLM_DSPARK_CONFIDENCE_THRESHOLD must be in [0, 1], "
+                f"got {threshold}"
+            )
+        return threshold
 
     @override
     def initialize_attn_backend(
@@ -244,6 +271,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
         return positions.view(batch_size, positions.shape[0] // batch_size)
 
     def _warmup_drafts(self, batch_size: int) -> torch.Tensor:
+        self._last_draft_lengths = [self.num_speculative_tokens] * batch_size
         return make_dspark_warmup_draft_token_ids(
             batch_size=batch_size,
             num_speculative_tokens=self.num_speculative_tokens,
@@ -251,14 +279,38 @@ class DSparkProposer(SpecDecodeBaseProposer):
             device=self.device,
         )
 
-    def _observe_confidence(self, confidence: torch.Tensor) -> None:
+    def _draft_lengths_from_confidence(
+        self,
+        confidence_rows: list[list[float]],
+    ) -> list[int]:
+        if self.confidence_threshold <= 0.0:
+            return [
+                min(self.num_speculative_tokens, len(row))
+                for row in confidence_rows
+            ]
+        return [
+            confidence_threshold_prefix_length(
+                row[: self.num_speculative_tokens],
+                self.confidence_threshold,
+            )
+            for row in confidence_rows
+        ]
+
+    def _observe_confidence(self, confidence: torch.Tensor) -> list[int]:
         confidence_rows = confidence.detach().float().cpu().tolist()
+        lengths = self._draft_lengths_from_confidence(confidence_rows)
         schedule = score_prefix_lengths(
             confidence_rows,
-            [min(self.num_speculative_tokens, len(row)) for row in confidence_rows],
+            lengths,
             steps_per_second=lambda _batch_tokens: 1.0,
         )
         self.diagnostics.observe(confidence_rows, schedule)
+        return lengths
+
+    def take_last_draft_lengths(self) -> list[int] | None:
+        lengths = self._last_draft_lengths
+        self._last_draft_lengths = None
+        return lengths
 
     @override
     @torch.inference_mode()
@@ -319,7 +371,11 @@ class DSparkProposer(SpecDecodeBaseProposer):
         ):
             draft_token_ids, confidence = self._run_draft_for_current_context()
         if confidence is not None:
-            self._observe_confidence(confidence[:batch_size])
+            self._last_draft_lengths = self._observe_confidence(
+                confidence[:batch_size]
+            )
+        else:
+            self._last_draft_lengths = [self.num_speculative_tokens] * batch_size
         return draft_token_ids[:batch_size, : self.num_speculative_tokens].to(
             torch.int32
         )

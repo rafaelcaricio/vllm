@@ -11,10 +11,6 @@ import torch
 from transformers import PretrainedConfig
 
 from vllm.config.speculative import SpeculativeConfig
-from vllm.models.deepseek_v4.nvidia.dspark_kernels import (
-    dspark_sparse_attention,
-    dspark_sparse_attention_torch,
-)
 from vllm.v1.spec_decode.dspark import (
     DSparkDiagnostics,
     DSparkModelSpec,
@@ -30,6 +26,14 @@ from vllm.v1.spec_decode.dspark import (
     unpack_mhc_pre_outputs,
 )
 from vllm.v1.spec_decode.dspark_proposer import DSparkProposer
+
+
+def _dspark_kernels():
+    return pytest.importorskip(
+        "vllm.models.deepseek_v4.nvidia.dspark_kernels",
+        reason="DeepSeek V4 CUDA/flash-attention extensions are unavailable",
+        exc_type=ImportError,
+    )
 
 
 def _normalize(values: Sequence[float]) -> tuple[float, ...]:
@@ -324,6 +328,7 @@ def _manual_dspark_sparse_attention(
 
 
 def test_dspark_sparse_attention_reference_matches_manual_window_semantics() -> None:
+    dspark_sparse_attention_torch = _dspark_kernels().dspark_sparse_attention_torch
     batch_size = 2
     block_size = 3
     num_heads = 2
@@ -369,6 +374,7 @@ def test_dspark_sparse_attention_reference_matches_manual_window_semantics() -> 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_dspark_sparse_attention_triton_matches_reference() -> None:
+    kernels = _dspark_kernels()
     device = torch.device("cuda")
     batch_size = 2
     block_size = 5
@@ -414,7 +420,7 @@ def test_dspark_sparse_attention_triton_matches_reference() -> None:
         dtype=torch.float32,
     )
 
-    actual = dspark_sparse_attention(
+    actual = kernels.dspark_sparse_attention(
         q,
         draft_kv,
         main_kv_cache,
@@ -423,7 +429,7 @@ def test_dspark_sparse_attention_triton_matches_reference() -> None:
         softmax_scale=head_dim**-0.5,
         scores_buffer=scores,
     )
-    expected = dspark_sparse_attention_torch(
+    expected = kernels.dspark_sparse_attention_torch(
         q,
         draft_kv,
         main_kv_cache,
@@ -437,6 +443,7 @@ def test_dspark_sparse_attention_triton_matches_reference() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_dspark_sparse_attention_triton_is_cuda_graph_safe() -> None:
+    dspark_sparse_attention = _dspark_kernels().dspark_sparse_attention
     device = torch.device("cuda")
     batch_size = 1
     block_size = 5
@@ -596,6 +603,70 @@ def test_dspark_proposer_wraps_draft_in_forward_context(
     assert context_num_tokens == [10]
     assert draft_ids.tolist() == [[7, 7, 7, 7, 7], [7, 7, 7, 7, 7]]
     assert draft_ids.dtype == torch.int32
+
+
+def test_dspark_proposer_confidence_threshold_sets_prefix_lengths() -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.num_speculative_tokens = 5
+    proposer.confidence_threshold = 0.73
+    proposer.diagnostics = DSparkDiagnostics(max_spec_tokens=5)
+
+    lengths = DSparkProposer._observe_confidence(
+        proposer,
+        torch.tensor(
+            [
+                [0.90, 0.80, 0.50, 0.90, 0.90],
+                [0.95, 0.95, 0.95, 0.95, 0.95],
+            ],
+            dtype=torch.float32,
+        ),
+    )
+
+    assert lengths == [1, 5]
+    snapshot = proposer.diagnostics.snapshot()
+    assert snapshot.num_requests == 2
+    assert snapshot.num_scheduled_draft_tokens == 6
+    assert snapshot.scheduled_length_histogram == (0, 1, 0, 0, 0, 1)
+
+
+def test_dspark_proposer_threshold_zero_keeps_full_block() -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.num_speculative_tokens = 5
+    proposer.confidence_threshold = 0.0
+
+    lengths = DSparkProposer._draft_lengths_from_confidence(
+        proposer,
+        [[0.10, 0.10], [0.10, 0.10, 0.10, 0.10, 0.10]],
+    )
+
+    assert lengths == [2, 5]
+
+
+def test_gpu_model_runner_trims_dspark_draft_rows_by_confidence_lengths() -> None:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    class FakeEvent:
+
+        def synchronize(self) -> None:
+            return None
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._draft_token_ids = torch.empty(2, 5)
+    runner._draft_token_req_ids = ["a", "b"]
+    runner.draft_token_ids_event = FakeEvent()
+    runner.draft_token_ids_cpu = torch.tensor(
+        [
+            [11, 12, 13, 14, 15],
+            [21, 22, 23, 24, 25],
+        ],
+        dtype=torch.int64,
+    )
+    runner._draft_token_lengths_cpu = [2, 0]
+
+    draft_token_ids, req_ids = GPUModelRunner._get_draft_token_ids_cpu(runner)
+
+    assert req_ids == ["a", "b"]
+    assert draft_token_ids == [[11, 12], []]
 
 
 def test_infer_dspark_weight_prefix_rejects_multiple_prefixes() -> None:
