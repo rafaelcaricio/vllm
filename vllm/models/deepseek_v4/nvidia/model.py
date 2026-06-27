@@ -551,8 +551,6 @@ direct_register_custom_op(
 )
 
 
-
-
 def _deepseek_v4_b12x_mhc_post_pre_op(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -1041,9 +1039,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         config = vllm_config.model_config.hf_config
         self.layer_name = prefix
         self._use_b12x_mhc = _use_b12x_mhc()
-        self._b12x_mhc_max_tokens = (
-            _b12x_mhc_max_tokens() if self._use_b12x_mhc else 0
-        )
+        self._b12x_mhc_max_tokens = _b12x_mhc_max_tokens() if self._use_b12x_mhc else 0
         if self._use_b12x_mhc:
             if not prefix:
                 raise RuntimeError("DeepSeek V4 b12x mHC decoder layer needs a prefix")
@@ -1053,9 +1049,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             compilation_config.static_forward_context[prefix] = self
 
             if self._b12x_mhc_max_tokens <= 0:
-                logger.info_once(
-                    "DeepSeek V4 b12x mHC enabled for all token counts."
-                )
+                logger.info_once("DeepSeek V4 b12x mHC enabled for all token counts.")
             else:
                 logger.info_once(
                     "DeepSeek V4 b12x mHC enabled for token counts <= %d; "
@@ -1204,7 +1198,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             comb=comb,
             out=out,
         )
-
 
     def _run_b12x_mhc_post_pre(
         self,
@@ -1616,6 +1609,24 @@ class DeepseekV4Model(nn.Module):
         else:
             self._mtp_hidden_buffer = None
 
+        self._dspark_target_layer_ids = tuple(
+            int(layer_id) for layer_id in getattr(config, "dspark_target_layer_ids", ())
+        )
+        if get_pp_group().is_last_rank and self._dspark_target_layer_ids:
+            self._dspark_hidden_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                len(self._dspark_target_layer_ids) * config.hidden_size,
+                dtype=vllm_config.model_config.dtype,
+                device=self.device,
+            )
+            self._dspark_layer_to_buffer_index = {
+                layer_id: idx
+                for idx, layer_id in enumerate(self._dspark_target_layer_ids)
+            }
+        else:
+            self._dspark_hidden_buffer = None
+            self._dspark_layer_to_buffer_index = {}
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1660,6 +1671,7 @@ class DeepseekV4Model(nn.Module):
             input_ids = input_ids.to(torch.int64)
 
         residual, post_mix, res_mix = None, None, None
+        layer = None
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
@@ -1669,7 +1681,22 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
-        if layer is not None and current_platform.is_cuda():
+            layer_idx = getattr(layer, "layer_name", "")
+            layer_id = extract_layer_index(layer_idx) if layer_idx else None
+            if layer_id in self._dspark_layer_to_buffer_index:
+                if current_platform.is_cuda() and residual is not None:
+                    hidden_states = layer.hc_post(
+                        hidden_states, residual, post_mix, res_mix
+                    )
+                    residual, post_mix, res_mix = None, None, None
+                buffer_idx = self._dspark_layer_to_buffer_index[layer_id]
+                if self._dspark_hidden_buffer is not None:
+                    start = buffer_idx * self.config.hidden_size
+                    end = start + self.config.hidden_size
+                    self._dspark_hidden_buffer[
+                        : hidden_states.shape[0], start:end
+                    ].copy_(hidden_states.mean(dim=1))
+        if layer is not None and current_platform.is_cuda() and residual is not None:
             hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
 
         if not get_pp_group().is_last_rank:
@@ -1911,6 +1938,14 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         hc_mult * hidden_size) for the MTP draft model. Populated by
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
+
+    def get_dspark_target_hidden_states(self) -> torch.Tensor | None:
+        """Concatenated DSpark target-layer features for the draft model.
+
+        Shape is (max_num_batched_tokens,
+        len(dspark_target_layer_ids) * hidden_size). Populated by forward().
+        """
+        return getattr(self.model, "_dspark_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
