@@ -637,6 +637,82 @@ def test_dspark_proposer_exports_greedy_draft_probs_for_quality_probe() -> None:
     assert DSparkProposer.take_last_draft_probs(proposer) is None
 
 
+def test_dspark_proposer_skips_confidence_observation_when_threshold_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.spec_decode.dspark_proposer as dspark_proposer_module
+
+    class FakeForwardContext:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class FakeDSparkModel:
+        def prefill_main(
+            self,
+            _hidden_by_req: torch.Tensor,
+            _positions_by_req: torch.Tensor,
+        ) -> None:
+            return None
+
+    monkeypatch.setattr(
+        dspark_proposer_module,
+        "set_forward_context",
+        lambda *_args, **_kwargs: FakeForwardContext(),
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_determine_graph_batch",
+        lambda _self, batch_size: (None, batch_size, None, None),
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_prepare_draft_buffers",
+        lambda _self, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_run_draft_for_current_context",
+        lambda _self: (
+            torch.full((1, 5), 7, dtype=torch.long),
+            torch.zeros(1, 5, 13, dtype=torch.float32),
+            torch.full((1, 5), 0.95, dtype=torch.float32),
+        ),
+    )
+
+    def fail_observe(*_args, **_kwargs):
+        raise AssertionError("confidence observation should be skipped")
+
+    monkeypatch.setattr(DSparkProposer, "_observe_confidence", fail_observe)
+
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.vllm_config = object()
+    proposer.device = torch.device("cpu")
+    proposer.num_speculative_tokens = 5
+    proposer.confidence_threshold = 0.0
+    proposer._collect_confidence_diagnostics = False
+    proposer._export_draft_probs = False
+    proposer._last_draft_probs = None
+    proposer._prefilled = True
+    proposer.model = FakeDSparkModel()
+
+    draft_ids = DSparkProposer.propose(
+        proposer,
+        target_token_ids=torch.empty(1, dtype=torch.long),
+        target_positions=torch.arange(1),
+        target_hidden_states=torch.zeros(1, 4),
+        next_token_ids=torch.tensor([11], dtype=torch.int32),
+        token_indices_to_sample=None,
+        common_attn_metadata=None,  # type: ignore[arg-type]
+        sampling_metadata=None,  # type: ignore[arg-type]
+    )
+
+    assert draft_ids.tolist() == [[7, 7, 7, 7, 7]]
+    assert DSparkProposer.take_last_draft_lengths(proposer) == [5]
+
+
 def test_dspark_proposer_trims_rejected_target_context() -> None:
 
     class AttentionMetadataStub:

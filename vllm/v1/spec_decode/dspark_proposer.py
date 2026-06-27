@@ -81,6 +81,9 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self._last_draft_lengths: list[int] | None = None
         self._last_draft_probs: torch.Tensor | None = None
         self._export_draft_probs = self._read_export_draft_probs()
+        self._collect_confidence_diagnostics = (
+            self._read_collect_confidence_diagnostics()
+        )
         if self.confidence_threshold > 0.0:
             logger.info(
                 "DSpark confidence-scheduled verification enabled with "
@@ -91,6 +94,11 @@ class DSparkProposer(SpecDecodeBaseProposer):
             logger.info(
                 "DSpark draft probability export enabled for quality profiling. "
                 "This adds a draft-logit softmax on greedy requests."
+            )
+        if self._collect_confidence_diagnostics:
+            logger.info(
+                "DSpark confidence diagnostics enabled. This copies confidence "
+                "scores to CPU on every draft step."
             )
 
     @staticmethod
@@ -113,6 +121,11 @@ class DSparkProposer(SpecDecodeBaseProposer):
     @staticmethod
     def _read_export_draft_probs() -> bool:
         raw = os.getenv("VLLM_DSPARK_EXPORT_DRAFT_PROBS", "0")
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _read_collect_confidence_diagnostics() -> bool:
+        raw = os.getenv("VLLM_DSPARK_COLLECT_CONFIDENCE_DIAGNOSTICS", "0")
         return raw.strip().lower() in {"1", "true", "yes", "on"}
 
     @override
@@ -380,6 +393,12 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self.diagnostics.observe(confidence_rows, schedule)
         return lengths
 
+    def _should_observe_confidence(self) -> bool:
+        return (
+            self.confidence_threshold > 0.0
+            or self._collect_confidence_diagnostics
+        )
+
     def take_last_draft_lengths(self) -> list[int] | None:
         lengths = self._last_draft_lengths
         self._last_draft_lengths = None
@@ -475,7 +494,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
                 self._run_draft_for_current_context()
             )
         self._maybe_store_draft_probs(draft_logits, sampling_metadata, batch_size)
-        if confidence is not None:
+        if confidence is not None and self._should_observe_confidence():
             self._last_draft_lengths = self._observe_confidence(
                 confidence[:batch_size]
             )

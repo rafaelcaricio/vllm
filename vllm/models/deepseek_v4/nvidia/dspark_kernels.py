@@ -8,6 +8,7 @@ import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
 _NEG_INF = -3.4028234663852886e38
+_DSPARK_SCORE_K_BLOCK = 16
 
 
 @triton.jit
@@ -262,7 +263,11 @@ def dspark_sparse_attention(
 
     scores = scores_buffer
     out = torch.empty_like(q)
-    k_score_block = 8
+    # Real DeepSeek V4 Flash DSpark shape is window=128, draft block=5,
+    # head_dim=512. K_BLOCK=16 measured faster than 8/32/64/128/256 on GB10:
+    # it cuts score-kernel programs without the register pressure of wider
+    # K tiles.
+    k_score_block = _DSPARK_SCORE_K_BLOCK
     k_out_block = _next_power_of_2(kv_tokens)
     d_score_block = 64
     d_out_block = 32
