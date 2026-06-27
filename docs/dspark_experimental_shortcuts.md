@@ -94,8 +94,40 @@ production branch.
   after first content was 33.94 tokens/s.
 - The same warm run produced 153 drafts, 765 draft tokens, and 102 accepted
   draft tokens. Accepted tokens by draft position were `[56, 25, 14, 6, 1]`.
+- Fixed-prompt salted repeatability profile on 2026-06-27 ran three times with
+  `cache_salt` to avoid prefix-cache reuse. Mean server-counter decode speed was
+  37.64 tokens/s with 10.02% CV. Mean accepted draft rate was 14.28% with
+  24.03% CV, so acceptance/reference parity is a measured priority before
+  treating fused-kernel-only work as the largest speed lever.
 
 ## Custom Kernel Opportunities
+
+- TODO P0: continue repeated warm interactive decode profiles before and after
+  each kernel change. Track TTFC, server-side generation tok/s, drafts, draft
+  tokens, accepted tokens, acceptance by position, and inference-time JIT
+  warnings. Initial fixed-prompt salted profile was captured on 2026-06-27.
+- TODO P0: add DSpark-specific observability for draft execution stages so we
+  can separate target verification time, `prefill_main`/main-KV update time,
+  draft sparse attention/projection time, Markov/logit selection time, and
+  rejection sampling time.
+- TODO P1: add warmup coverage for inference-time JIT gaps observed on the real
+  server: request-prep metadata, route packing, EAGLE-named speculative prep,
+  and rejection greedy sampling.
+- TODO P1: add FlashInfer sparse MLA tuning buckets for DSpark decode and graph
+  capture shapes that currently fall back to tactic `-1`.
+- TODO P1: implement a fused DSpark sparse-attention kernel that combines score
+  calculation, sink-aware softmax denominator, and value accumulation without a
+  materialized score buffer.
+- TODO P1: fuse DSpark `store_main_kv()` for the single-token decode path across
+  norm/projection/RoPE/cache-store work.
+- TODO P2: restore reference-parity DSpark `act_quant`, attention/MHC handling,
+  and sampling behavior to improve draft acceptance rate, not only draft speed.
+- TODO P2: fuse sparse attention output with inverse RoPE, FP8 quantization, and
+  `wo_a`/`wo_b` projection.
+- TODO P2: fuse Markov-head logits addition, greedy draft token selection, and
+  confidence aggregation across the fixed five-token DSpark block.
+- TODO P3: move confidence diagnostics and prefix-pruning decisions to a
+  GPU-side/asynchronous metrics path.
 
 - Implemented first pass: replace `DeepSeekV4DSparkAttention`'s PyTorch
   sparse-attention loop with a graph-safe native kernel for the serving decode
