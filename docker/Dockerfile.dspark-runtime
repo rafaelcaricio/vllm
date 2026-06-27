@@ -8,6 +8,7 @@ ARG VLLM_SITE=/opt/env/lib/python3.12/site-packages/vllm
 
 COPY vllm/envs.py ${VLLM_SITE}/envs.py
 COPY vllm/config/speculative.py ${VLLM_SITE}/config/speculative.py
+COPY vllm/model_executor/warmup/kernel_warmup.py ${VLLM_SITE}/model_executor/warmup/kernel_warmup.py
 COPY vllm/model_executor/models/registry.py ${VLLM_SITE}/model_executor/models/registry.py
 COPY vllm/v1/outputs.py ${VLLM_SITE}/v1/outputs.py
 COPY vllm/v1/core/sched/scheduler.py ${VLLM_SITE}/v1/core/sched/scheduler.py

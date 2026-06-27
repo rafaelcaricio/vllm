@@ -38,6 +38,9 @@ _DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
 
 _DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS = 16
 _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = 8192
+_DEEPSEEK_V4_DSPARK_DECODE_AUTOTUNE_SEQ_LENS = (512, 2048)
+_DEEPSEEK_V4_DSPARK_SHORT_PREFILL_WARMUP_TOKENS = (20, 32)
+_DEEPSEEK_V4_DSPARK_ROUTE_PACK_PREFILL_TOKENS = (512, 513, 1024)
 
 # Fan of num_tokens specializations to pre-JIT for
 # `_compute_slot_mapping_kernel`. On SM12x cold JIT can emit
@@ -83,6 +86,288 @@ def _runner_max_num_tokens(runner: "GPUModelRunner") -> int:
     scheduler_config = getattr(runner, "scheduler_config", None)
     max_num_batched_tokens = getattr(scheduler_config, "max_num_batched_tokens", 1)
     return int(max_num_batched_tokens)
+
+
+def _runner_vocab_size(runner: "GPUModelRunner") -> int:
+    vocab_size = getattr(runner, "vocab_size", None)
+    if vocab_size is not None:
+        return int(vocab_size)
+
+    model_config = getattr(runner, "model_config", None)
+    get_vocab_size = getattr(model_config, "get_vocab_size", None)
+    if get_vocab_size is not None:
+        return int(get_vocab_size())
+
+    input_batch = getattr(runner, "input_batch", None)
+    vocab_size = getattr(input_batch, "vocab_size", None)
+    if vocab_size is not None:
+        return int(vocab_size)
+
+    return 1
+
+
+def _deepseek_v4_hf_config(worker: "Worker") -> object | None:
+    model_config = getattr(worker.model_runner, "model_config", None)
+    return getattr(model_config, "hf_text_config", None) or getattr(
+        model_config, "hf_config", None
+    )
+
+
+def _dspark_spec_decode_query_len(worker: "Worker") -> int | None:
+    spec_config = getattr(worker.vllm_config, "speculative_config", None)
+    if spec_config is None:
+        return None
+    is_dspark = getattr(spec_config, "is_dspark", None)
+    if is_dspark is not None:
+        if not is_dspark():
+            return None
+    elif getattr(spec_config, "method", None) != "dspark":
+        return None
+
+    num_spec_tokens = getattr(spec_config, "num_speculative_tokens", None)
+    if num_spec_tokens is None:
+        return None
+    query_len = int(num_spec_tokens) + 1
+    if query_len <= 1:
+        return None
+    return query_len
+
+
+def _dspark_uniform_decode_autotune_kwargs(
+    worker: "Worker",
+) -> list[dict[str, object]]:
+    query_len = _dspark_spec_decode_query_len(worker)
+    if query_len is None:
+        return []
+    max_tokens = _runner_max_num_tokens(worker.model_runner)
+    if query_len > max_tokens:
+        return []
+
+    max_model_len = int(getattr(worker.model_runner, "max_model_len", 0) or 0)
+    seq_lens = [
+        seq_len
+        for seq_len in _DEEPSEEK_V4_DSPARK_DECODE_AUTOTUNE_SEQ_LENS
+        if max_model_len <= 0 or seq_len <= max_model_len
+    ]
+    if not seq_lens:
+        seq_lens = [query_len]
+
+    return [
+        dict(
+            num_tokens=query_len,
+            skip_eplb=True,
+            is_profile=True,
+            force_attention=True,
+            uniform_decode=True,
+            profile_seq_lens=seq_len,
+        )
+        for seq_len in seq_lens
+    ]
+
+
+def _dspark_route_pack_token_counts(worker: "Worker") -> tuple[int, ...]:
+    query_len = _dspark_spec_decode_query_len(worker)
+    if query_len is None:
+        return ()
+
+    max_tokens = _runner_max_num_tokens(worker.model_runner)
+    token_counts = [query_len]
+    token_counts.extend(_DEEPSEEK_V4_DSPARK_SHORT_PREFILL_WARMUP_TOKENS)
+    token_counts.extend(_DEEPSEEK_V4_DSPARK_ROUTE_PACK_PREFILL_TOKENS)
+    return tuple(
+        sorted(
+            {token_count for token_count in token_counts if token_count <= max_tokens}
+        )
+    )
+
+
+def _dspark_warmup_request_counts(worker: "Worker") -> tuple[int, ...]:
+    max_num_seqs = max(1, int(worker.scheduler_config.max_num_seqs))
+    return tuple(sorted({1, min(max_num_seqs, 4)}))
+
+
+@torch.inference_mode()
+def _deepseek_v4_b12x_route_pack_warmup(worker: "Worker") -> None:
+    """Pre-JIT B12X/FlashInfer W4A16 MoE route-packing kernels.
+
+    DSpark's first live request is usually a short prompt plus speculative
+    decode width 6. Those shapes are too small to be covered reliably by the
+    broader DeepGEMM warmup, but they still hit Triton route-pack prefix kernels.
+    """
+    token_counts = _dspark_route_pack_token_counts(worker)
+    if not token_counts:
+        return
+
+    hf_config = _deepseek_v4_hf_config(worker)
+    num_experts = int(getattr(hf_config, "n_routed_experts", 0) or 0)
+    top_k = int(getattr(hf_config, "num_experts_per_tok", 0) or 0)
+    if num_experts <= 0 or top_k <= 0:
+        return
+
+    try:
+        from b12x.moe.fused.w4a16.host import select_route_block_size_m
+        from b12x.moe.fused.w4a16.kernel import pack_topk_routes_by_expert
+    except ImportError:
+        logger.debug("Skipping B12X route-pack warmup: package is unavailable.")
+        return
+
+    device = worker.model_runner.device
+    for token_count in token_counts:
+        block_size_m = select_route_block_size_m(token_count, top_k, num_experts)
+        topk_ids = torch.zeros(
+            (token_count, top_k), dtype=torch.int32, device=device
+        )
+        pack_topk_routes_by_expert(topk_ids, block_size_m, num_experts)
+
+
+@torch.inference_mode()
+def _deepseek_v4_spec_decode_padded_kernel_warmup(worker: "Worker") -> None:
+    """Pre-JIT padded speculative decode input-prep kernels.
+
+    DSpark uses the padded speculative path with query length
+    `1 + num_speculative_tokens`; the first real request otherwise pays Triton
+    JIT for these small kernels.
+    """
+    query_len = _dspark_spec_decode_query_len(worker)
+    if query_len is None:
+        return
+
+    runner = worker.model_runner
+    device = runner.device
+    vocab_size = _runner_vocab_size(runner)
+    block_size_tokens = 1 << (query_len - 1).bit_length()
+
+    next_token_kernel, inputs_kernel = _spec_decode_padded_warmup_kernels()
+
+    for num_reqs in _dspark_warmup_request_counts(worker):
+        sampled_token_ids = torch.zeros(
+            (num_reqs, query_len), dtype=torch.int32, device=device
+        )
+        if query_len > 1:
+            sampled_token_ids[:, -1] = -1
+        discard_buffer = getattr(
+            getattr(runner, "discard_request_mask", None), "gpu", None
+        )
+        if discard_buffer is not None and discard_buffer.numel() >= num_reqs:
+            discard_request_mask = discard_buffer[:num_reqs]
+            discard_request_mask.zero_()
+        else:
+            discard_request_mask = torch.zeros(
+                num_reqs, dtype=torch.bool, device=device
+            )
+
+        drafter = getattr(runner, "drafter", None)
+        backup_buffer = getattr(
+            getattr(drafter, "backup_next_token_ids", None), "gpu", None
+        )
+        if backup_buffer is not None and backup_buffer.numel() >= num_reqs:
+            backup_tokens = backup_buffer[:num_reqs]
+            backup_tokens.zero_()
+        else:
+            backup_tokens = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+
+        next_token_ids = torch.empty(num_reqs, dtype=torch.int32, device=device)
+        valid_sampled_tokens_count = torch.empty(
+            num_reqs, dtype=torch.int32, device=device
+        )
+
+        next_token_kernel[(num_reqs,)](
+            sampled_token_ids,
+            discard_request_mask,
+            backup_tokens,
+            next_token_ids,
+            valid_sampled_tokens_count,
+            vocab_size,
+            query_len,
+            num_reqs,
+            sampled_token_ids.stride(0),
+            BLOCK_SIZE_TOKENS=block_size_tokens,
+        )
+
+        cu_num_draft_tokens = torch.arange(
+            query_len - 1,
+            (query_len - 1) * num_reqs + 1,
+            query_len - 1,
+            dtype=torch.int32,
+            device=device,
+        )
+        query_start_loc = torch.arange(
+            0,
+            query_len * num_reqs + 1,
+            query_len,
+            dtype=torch.int32,
+            device=device,
+        )
+        token_indices_to_sample = torch.empty(
+            num_reqs, dtype=torch.int32, device=device
+        )
+        num_rejected_tokens = torch.empty(num_reqs, dtype=torch.int32, device=device)
+
+        inputs_kernel[(num_reqs,)](
+            cu_num_draft_tokens,
+            valid_sampled_tokens_count,
+            query_start_loc,
+            token_indices_to_sample,
+            num_rejected_tokens,
+            num_reqs,
+        )
+
+
+@torch.inference_mode()
+def _deepseek_v4_rejection_sampler_warmup(worker: "Worker") -> None:
+    """Pre-JIT greedy rejection sampling for the DSpark draft width."""
+    query_len = _dspark_spec_decode_query_len(worker)
+    if query_len is None:
+        return
+
+    num_draft_tokens = query_len - 1
+    if num_draft_tokens <= 0:
+        return
+
+    from vllm.v1.sample.rejection_sampler import rejection_greedy_sample_kernel
+
+    device = worker.model_runner.device
+    for batch_size in _dspark_warmup_request_counts(worker):
+        total_draft_tokens = batch_size * num_draft_tokens
+        output_token_ids = torch.empty(
+            (batch_size, query_len), dtype=torch.int32, device=device
+        )
+        cu_num_draft_tokens = torch.arange(
+            num_draft_tokens,
+            total_draft_tokens + 1,
+            num_draft_tokens,
+            dtype=torch.int32,
+            device=device,
+        )
+        draft_token_ids = torch.zeros(
+            total_draft_tokens, dtype=torch.int32, device=device
+        )
+        target_argmax = torch.zeros(
+            total_draft_tokens, dtype=torch.int64, device=device
+        )
+        bonus_token_ids = torch.zeros((batch_size, 1), dtype=torch.int32, device=device)
+
+        rejection_greedy_sample_kernel[(batch_size,)](
+            output_token_ids,
+            cu_num_draft_tokens,
+            draft_token_ids,
+            target_argmax,
+            bonus_token_ids,
+            None,
+            num_draft_tokens,
+            None,
+            None,
+            SYNTHETIC_MODE=False,
+        )
+
+
+def _spec_decode_padded_warmup_kernels():
+    from vllm.v1.spec_decode.utils import (
+        eagle_prepare_inputs_padded_kernel,
+        eagle_prepare_next_token_padded_kernel,
+    )
+
+    return eagle_prepare_next_token_padded_kernel, eagle_prepare_inputs_padded_kernel
 
 
 def _deepseek_v4_slot_mapping_warmup(runner: "GPUModelRunner") -> None:
@@ -170,6 +455,9 @@ def _deepseek_v4_request_prep_warmup(worker: "Worker") -> None:
 
     logger.info("Warming up DeepSeek V4 request preparation kernels.")
     _deepseek_v4_slot_mapping_warmup(runner)
+    _deepseek_v4_b12x_route_pack_warmup(worker)
+    _deepseek_v4_spec_decode_padded_kernel_warmup(worker)
+    _deepseek_v4_rejection_sampler_warmup(worker)
     torch.accelerator.synchronize()
 
 
@@ -203,13 +491,26 @@ def _deepseek_v4_sparse_mla_decode_autotune(
     is_leader = world.rank_in_group == 0
     cache_path = _resolve_flashinfer_autotune_file(runner)
 
-    dummy_run_kwargs = dict(
-        num_tokens=num_tokens,
-        skip_eplb=True,
-        is_profile=True,
-        force_attention=True,
-        create_mixed_batch=True,
-    )
+    dummy_run_kwargs: list[dict[str, object]] = [
+        dict(
+            num_tokens=num_tokens,
+            skip_eplb=True,
+            is_profile=True,
+            force_attention=True,
+            create_mixed_batch=True,
+        )
+    ]
+    dummy_run_kwargs.extend(_dspark_uniform_decode_autotune_kwargs(worker))
+
+    if is_leader and len(dummy_run_kwargs) > 1:
+        logger.info(
+            "Including %d DSpark uniform-decode sparse MLA autotune shapes.",
+            len(dummy_run_kwargs) - 1,
+        )
+
+    def run_autotune_shapes() -> None:
+        for kwargs in dummy_run_kwargs:
+            runner._dummy_run(**kwargs)
 
     if is_leader:
         logger.info(
@@ -221,9 +522,9 @@ def _deepseek_v4_sparse_mla_decode_autotune(
     with torch.inference_mode():
         if is_leader:
             with sparse_mla_sm120_decode_dsv4_autotune(cache_path=str(cache_path)):
-                runner._dummy_run(**dummy_run_kwargs)
+                run_autotune_shapes()
         else:
-            runner._dummy_run(**dummy_run_kwargs)
+            run_autotune_shapes()
 
     tune_results: bytes | None = None
     if is_leader and cache_path.exists():
@@ -297,6 +598,19 @@ def _deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
                 create_mixed_batch=True,
             )
     if prefill_tokens > 0:
+        for short_prefill_tokens in _DEEPSEEK_V4_DSPARK_SHORT_PREFILL_WARMUP_TOKENS:
+            short_prefill_tokens = _clamp_warmup_tokens(
+                short_prefill_tokens, max_tokens
+            )
+            if short_prefill_tokens <= 0:
+                continue
+            runner._dummy_run(
+                num_tokens=short_prefill_tokens,
+                skip_eplb=True,
+                is_profile=True,
+                force_attention=True,
+                create_single_prefill=True,
+            )
         runner._dummy_run(
             num_tokens=prefill_tokens,
             skip_eplb=True,
