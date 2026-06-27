@@ -30,6 +30,10 @@ production branch.
   can skew the first verified decode step.
 - Draft tokens are selected greedily from DSpark logits. Sampling-temperature
   aware DSpark draft sampling from the reference code is not wired yet.
+- The DeepSpec paper's offline evaluation uses sampling temperature `1.0`, and
+  the released model card recommends `temperature=1.0, top_p=1.0`. Current
+  performance runs are greedy `temperature=0.0`, so they intentionally exercise
+  a narrower path.
 - Confidence-scheduled verification has a first-pass static threshold knob
   (`VLLM_DSPARK_CONFIDENCE_THRESHOLD`) that prunes each request to the longest
   cumulative-survival prefix above the threshold before vLLM verification. This
@@ -44,6 +48,9 @@ production branch.
   path before production benchmarking.
 - Draft probabilities are not returned for probabilistic rejection sampling.
   The current path targets greedy single-stream benchmarking first.
+- Confidence scheduling consumes sigmoided probabilities today. The paper's STS
+  calibration is a temperature scaling of confidence logits; if calibration
+  scalars become available, apply them before sigmoid.
 - DSpark's draft model is integrated as `method="dspark"` with first-pass
   CUDA-graph key initialization and dummy-run support. This is enough for the
   real server to capture graphs, but capture metadata and logging should be
@@ -157,6 +164,10 @@ production branch.
   norm/projection/RoPE/cache-store work.
 - TODO P2: restore reference-parity DSpark `act_quant`, attention/MHC handling,
   and sampling behavior to improve draft acceptance rate, not only draft speed.
+- TODO P2: add a low-overhead first-token quality diagnostic. The latest
+  paper-style conditional acceptance read shows healthy suffix acceptance in
+  steady runs but large position-0 variance, so first-token draft quality is a
+  prime acceptance suspect.
 - TODO P2: fuse sparse attention output with inverse RoPE, FP8 quantization, and
   `wo_a`/`wo_b` projection.
 - TODO P2: fuse Markov-head logits addition, greedy draft token selection, and
