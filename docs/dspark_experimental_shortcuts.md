@@ -117,6 +117,11 @@ production branch.
   tokens dropped from 5.00 to 3.59 per draft and mean accepted draft rate rose
   from 14.28% to 30.06%. This proves pruning is active, but static threshold
   `0.50` is not a clear speed win yet.
+- Goal gate: do not treat the confidence bridge as complete until repeated
+  real-model single-stream decode speed is recorded and increases
+  significantly. The current result explains why: pruning and acceptance can
+  improve while variable-prefix scheduling, route packing, rejection sampling,
+  or confidence miscalibration erase the throughput gain.
 
 ## Custom Kernel Opportunities
 
@@ -132,6 +137,10 @@ production branch.
   against the real model and record tok/s, scheduled length, prune rate,
   accepted tokens, and acceptance by position. Compare static thresholding with
   the paper's hardware-aware scheduler before promoting a default.
+- TODO P0: use the threshold sweep as the next speed gate. Test thresholds such
+  as `0.20`, `0.35`, and `0.50` with three post-JIT salted repetitions each;
+  keep only changes that materially beat the 37.64 tokens/s fixed-length
+  baseline without exploding CV.
 - TODO P0: profile the variable-prefix async bridge overhead. The corrected
   threshold `0.50` run reduced verified draft tokens but increased tok/s
   variance, so measure scheduler placeholder updates, ragged metadata creation,
