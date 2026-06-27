@@ -569,6 +569,9 @@ class DeepSeekV4DSparkModel(nn.Module):
         main_positions: torch.Tensor,
         lm_head: ParallelLMHead,
         logits_processor: LogitsProcessor,
+        *,
+        return_logits: bool = True,
+        return_confidence: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = input_ids.shape[0]
         block_size = self.block_size
@@ -616,15 +619,22 @@ class DeepSeekV4DSparkModel(nn.Module):
 
         output_ids = input_ids.new_empty(batch_size, block_size + 1)
         output_ids[:, 0] = input_ids
-        markov_embeds = []
+        markov_embeds = [] if return_confidence else None
         for pos in range(block_size):
             markov_logits, markov_embed = final_layer.markov_head(output_ids[:, pos])
             logits[:, pos].add_(markov_logits)
-            markov_embeds.append(markov_embed)
+            if markov_embeds is not None:
+                markov_embeds.append(markov_embed)
             output_ids[:, pos + 1] = logits[:, pos].argmax(dim=-1)
 
-        markov_embed = torch.stack(markov_embeds, dim=1)
-        confidence = final_layer.confidence_head(dense, markov_embed).sigmoid()
+        if return_confidence:
+            assert markov_embeds is not None
+            markov_embed = torch.stack(markov_embeds, dim=1)
+            confidence = final_layer.confidence_head(dense, markov_embed).sigmoid()
+        else:
+            confidence = dense.new_empty((batch_size, 0), dtype=torch.float32)
+        if not return_logits:
+            logits = logits.new_empty((0, 0, 0))
         return output_ids[:, 1:], logits, confidence
 
     def finalize_mega_moe_weights(self) -> None:
@@ -680,6 +690,9 @@ class DeepSeekV4DSpark(nn.Module):
         input_ids: torch.Tensor,
         main_hidden: torch.Tensor,
         main_positions: torch.Tensor,
+        *,
+        return_logits: bool = True,
+        return_confidence: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         draft_ids, logits, confidence = self.model.draft(
             input_ids,
@@ -687,6 +700,8 @@ class DeepSeekV4DSpark(nn.Module):
             main_positions,
             self.lm_head,
             self.logits_processor,
+            return_logits=return_logits,
+            return_confidence=return_confidence,
         )
         return draft_ids, logits, confidence
 

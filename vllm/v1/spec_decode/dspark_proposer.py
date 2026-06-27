@@ -100,6 +100,11 @@ class DSparkProposer(SpecDecodeBaseProposer):
                 "DSpark confidence diagnostics enabled. This copies confidence "
                 "scores to CPU on every draft step."
             )
+        if not self._needs_draft_logits() and not self._needs_confidence():
+            logger.info(
+                "DSpark fast draft-output mode enabled: confidence head and "
+                "returned draft logits are skipped on the hot path."
+            )
 
     @staticmethod
     def _read_confidence_threshold() -> float:
@@ -260,6 +265,8 @@ class DSparkProposer(SpecDecodeBaseProposer):
             self._draft_input_ids_buffer[:batch_size],
             self._draft_hidden_buffer[:batch_size],
             self._draft_positions_buffer[:batch_size],
+            return_logits=self._needs_draft_logits(),
+            return_confidence=self._needs_confidence(),
         )
 
     def _run_draft_for_current_context(
@@ -399,6 +406,12 @@ class DSparkProposer(SpecDecodeBaseProposer):
             or self._collect_confidence_diagnostics
         )
 
+    def _needs_confidence(self) -> bool:
+        return self._should_observe_confidence()
+
+    def _needs_draft_logits(self) -> bool:
+        return self._export_draft_probs
+
     def take_last_draft_lengths(self) -> list[int] | None:
         lengths = self._last_draft_lengths
         self._last_draft_lengths = None
@@ -417,6 +430,12 @@ class DSparkProposer(SpecDecodeBaseProposer):
     ) -> None:
         self._last_draft_probs = None
         if not getattr(self, "_export_draft_probs", False):
+            return
+        if draft_logits.numel() == 0:
+            logger.warning_once(
+                "DSpark draft probability export requested but draft logits "
+                "were not returned by the draft model."
+            )
             return
         if not sampling_metadata.all_greedy:
             logger.warning_once(
@@ -494,7 +513,11 @@ class DSparkProposer(SpecDecodeBaseProposer):
                 self._run_draft_for_current_context()
             )
         self._maybe_store_draft_probs(draft_logits, sampling_metadata, batch_size)
-        if confidence is not None and self._should_observe_confidence():
+        if (
+            confidence is not None
+            and confidence.numel() > 0
+            and self._should_observe_confidence()
+        ):
             self._last_draft_lengths = self._observe_confidence(
                 confidence[:batch_size]
             )

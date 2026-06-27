@@ -713,6 +713,80 @@ def test_dspark_proposer_skips_confidence_observation_when_threshold_off(
     assert DSparkProposer.take_last_draft_lengths(proposer) == [5]
 
 
+@pytest.mark.parametrize(
+    (
+        "confidence_threshold",
+        "collect_confidence_diagnostics",
+        "export_draft_probs",
+        "expected_return_logits",
+        "expected_return_confidence",
+    ),
+    [
+        (0.0, False, False, False, False),
+        (0.5, False, False, False, True),
+        (0.0, True, False, False, True),
+        (0.0, False, True, True, False),
+    ],
+)
+def test_dspark_proposer_requests_only_needed_draft_outputs(
+    confidence_threshold: float,
+    collect_confidence_diagnostics: bool,
+    export_draft_probs: bool,
+    expected_return_logits: bool,
+    expected_return_confidence: bool,
+) -> None:
+    observed_flags: list[tuple[bool, bool]] = []
+
+    class FakeModel:
+        def draft_with_confidence(
+            self,
+            input_ids: torch.Tensor,
+            hidden_states: torch.Tensor,
+            positions: torch.Tensor,
+            *,
+            return_logits: bool,
+            return_confidence: bool,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            observed_flags.append((return_logits, return_confidence))
+            batch_size = input_ids.shape[0]
+            logits = (
+                torch.zeros(batch_size, 5, 13)
+                if return_logits
+                else torch.empty(0, 0, 0)
+            )
+            confidence = (
+                torch.ones(batch_size, 5)
+                if return_confidence
+                else torch.empty(batch_size, 0)
+            )
+            return torch.full((batch_size, 5), 7), logits, confidence
+
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.model = FakeModel()
+    proposer._draft_graph_batch_size = 2
+    proposer._draft_input_ids_buffer = torch.tensor([11, 12], dtype=torch.long)
+    proposer._draft_hidden_buffer = torch.zeros(2, 4)
+    proposer._draft_positions_buffer = torch.arange(2, dtype=torch.long)
+    proposer.confidence_threshold = confidence_threshold
+    proposer._collect_confidence_diagnostics = collect_confidence_diagnostics
+    proposer._export_draft_probs = export_draft_probs
+
+    draft_ids, logits, confidence = DSparkProposer._run_draft_from_buffers(
+        proposer
+    )
+
+    assert observed_flags == [
+        (expected_return_logits, expected_return_confidence)
+    ]
+    assert draft_ids.tolist() == [[7, 7, 7, 7, 7], [7, 7, 7, 7, 7]]
+    assert logits.numel() > 0 if expected_return_logits else logits.numel() == 0
+    assert (
+        confidence.numel() > 0
+        if expected_return_confidence
+        else confidence.numel() == 0
+    )
+
+
 def test_dspark_proposer_trims_rejected_target_context() -> None:
 
     class AttentionMetadataStub:
