@@ -578,6 +578,7 @@ def test_dspark_proposer_wraps_draft_in_forward_context(
         "_run_draft_for_current_context",
         lambda _self: (
             torch.full((2, 5), 7, dtype=torch.long),
+            torch.zeros(2, 5, 13, dtype=torch.float32),
             None,
         ),
     )
@@ -603,6 +604,82 @@ def test_dspark_proposer_wraps_draft_in_forward_context(
     assert context_num_tokens == [10]
     assert draft_ids.tolist() == [[7, 7, 7, 7, 7], [7, 7, 7, 7, 7]]
     assert draft_ids.dtype == torch.int32
+
+
+def test_dspark_proposer_exports_greedy_draft_probs_for_quality_probe() -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.num_speculative_tokens = 3
+    proposer._export_draft_probs = True
+    proposer._last_draft_probs = None
+
+    class SamplingMetadataStub:
+        all_greedy = True
+
+    logits = torch.tensor(
+        [
+            [[3.0, 1.0, 0.0, -1.0], [0.0, 2.0, 1.0, -2.0], [1.0, 1.0, 1.0, 1.0]],
+            [[-1.0, 0.0, 1.0, 2.0], [4.0, 0.0, 0.0, 0.0], [0.0, -1.0, -2.0, -3.0]],
+        ],
+        dtype=torch.float32,
+    )
+
+    DSparkProposer._maybe_store_draft_probs(
+        proposer,
+        logits,
+        SamplingMetadataStub(),  # type: ignore[arg-type]
+        batch_size=2,
+    )
+
+    draft_probs = DSparkProposer.take_last_draft_probs(proposer)
+    assert draft_probs is not None
+    assert draft_probs.shape == logits.shape
+    torch.testing.assert_close(draft_probs, logits.softmax(dim=-1))
+    assert DSparkProposer.take_last_draft_probs(proposer) is None
+
+
+def test_dspark_proposer_trims_rejected_target_context() -> None:
+
+    class AttentionMetadataStub:
+        query_start_loc_cpu = torch.tensor([0, 4, 8], dtype=torch.int32)
+        query_start_loc = query_start_loc_cpu
+
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    hidden = torch.arange(8 * 2, dtype=torch.float32).reshape(8, 2)
+    positions = torch.arange(8, dtype=torch.long)
+
+    trimmed_hidden, trimmed_positions = (
+        DSparkProposer._trim_rejected_target_context(
+            proposer,
+            hidden,
+            positions,
+            AttentionMetadataStub(),  # type: ignore[arg-type]
+            torch.tensor([1, 1], dtype=torch.int32),
+        )
+    )
+
+    assert trimmed_positions.tolist() == [0, 1, 2, 4, 5, 6]
+    torch.testing.assert_close(
+        trimmed_hidden,
+        torch.cat([hidden[0:3], hidden[4:7]], dim=0),
+    )
+
+
+def test_dspark_proposer_rejects_non_uniform_trimmed_context() -> None:
+
+    class AttentionMetadataStub:
+        query_start_loc_cpu = torch.tensor([0, 4, 8], dtype=torch.int32)
+        query_start_loc = query_start_loc_cpu
+
+    proposer = DSparkProposer.__new__(DSparkProposer)
+
+    with pytest.raises(ValueError, match="uniform effective"):
+        DSparkProposer._trim_rejected_target_context(
+            proposer,
+            torch.zeros(8, 2),
+            torch.arange(8),
+            AttentionMetadataStub(),  # type: ignore[arg-type]
+            torch.tensor([1, 2], dtype=torch.int32),
+        )
 
 
 def test_dspark_proposer_confidence_threshold_sets_prefix_lengths() -> None:

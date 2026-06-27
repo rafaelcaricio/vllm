@@ -680,15 +680,15 @@ class DeepSeekV4DSpark(nn.Module):
         input_ids: torch.Tensor,
         main_hidden: torch.Tensor,
         main_positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        draft_ids, _logits, confidence = self.model.draft(
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        draft_ids, logits, confidence = self.model.draft(
             input_ids,
             main_hidden,
             main_positions,
             self.lm_head,
             self.logits_processor,
         )
-        return draft_ids, confidence
+        return draft_ids, logits, confidence
 
     def take_last_confidence(self) -> torch.Tensor | None:
         confidence = self._last_confidence

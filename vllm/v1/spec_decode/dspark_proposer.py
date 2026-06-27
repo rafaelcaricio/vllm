@@ -79,11 +79,18 @@ class DSparkProposer(SpecDecodeBaseProposer):
         )
         self.confidence_threshold = self._read_confidence_threshold()
         self._last_draft_lengths: list[int] | None = None
+        self._last_draft_probs: torch.Tensor | None = None
+        self._export_draft_probs = self._read_export_draft_probs()
         if self.confidence_threshold > 0.0:
             logger.info(
                 "DSpark confidence-scheduled verification enabled with "
                 "threshold %.4f.",
                 self.confidence_threshold,
+            )
+        if self._export_draft_probs:
+            logger.info(
+                "DSpark draft probability export enabled for quality profiling. "
+                "This adds a draft-logit softmax on greedy requests."
             )
 
     @staticmethod
@@ -102,6 +109,11 @@ class DSparkProposer(SpecDecodeBaseProposer):
                 f"got {threshold}"
             )
         return threshold
+
+    @staticmethod
+    def _read_export_draft_probs() -> bool:
+        raw = os.getenv("VLLM_DSPARK_EXPORT_DRAFT_PROBS", "0")
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
 
     @override
     def initialize_attn_backend(
@@ -227,7 +239,9 @@ class DSparkProposer(SpecDecodeBaseProposer):
             self._draft_hidden_buffer[pad_slice].zero_()
             self._draft_positions_buffer[pad_slice].zero_()
 
-    def _run_draft_from_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _run_draft_from_buffers(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = self._draft_graph_batch_size
         return self.model.draft_with_confidence(
             self._draft_input_ids_buffer[:batch_size],
@@ -235,7 +249,9 @@ class DSparkProposer(SpecDecodeBaseProposer):
             self._draft_positions_buffer[:batch_size],
         )
 
-    def _run_draft_for_current_context(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _run_draft_for_current_context(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._draft_graph_runner is not None:
             return self._draft_graph_runner()
         return self._run_draft_from_buffers()
@@ -269,6 +285,63 @@ class DSparkProposer(SpecDecodeBaseProposer):
                 f"got {positions.shape[0]} rows for batch_size={batch_size}."
             )
         return positions.view(batch_size, positions.shape[0] // batch_size)
+
+    def _trim_rejected_target_context(
+        self,
+        target_hidden_states: torch.Tensor,
+        target_positions: torch.Tensor,
+        common_attn_metadata: CommonAttentionMetadata | None,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Drop rejected verification suffixes before updating DSpark context.
+
+        Padded speculative decoding keeps rejected tokens in the target forward
+        as padding and expects proposers to ignore them. DSpark stores target
+        hidden states in an internal context cache, so rejected suffix states
+        must be removed before `prefill_main()`.
+        """
+        if num_rejected_tokens_gpu is None or common_attn_metadata is None:
+            return target_hidden_states, target_positions
+
+        rejected = num_rejected_tokens_gpu.detach().cpu().tolist()
+        if not any(int(value) for value in rejected):
+            return target_hidden_states, target_positions
+
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        if query_start_loc_cpu is None:
+            query_start_loc_cpu = common_attn_metadata.query_start_loc.detach().cpu()
+        query_starts = query_start_loc_cpu.tolist()
+        if len(query_starts) != len(rejected) + 1:
+            raise ValueError(
+                "DSpark rejected-context trimming requires query_start_loc "
+                "to have batch_size + 1 entries; got "
+                f"{len(query_starts)} starts for {len(rejected)} requests."
+            )
+
+        hidden_chunks: list[torch.Tensor] = []
+        position_chunks: list[torch.Tensor] = []
+        effective_lengths: list[int] = []
+        flat_positions = target_positions.reshape(-1)
+        for req_index, num_rejected in enumerate(rejected):
+            start = int(query_starts[req_index])
+            end = int(query_starts[req_index + 1]) - int(num_rejected)
+            if end <= start:
+                raise ValueError(
+                    "DSpark rejected-context trimming removed every token for "
+                    f"request {req_index}: start={start}, end={end}."
+                )
+            hidden_chunks.append(target_hidden_states[start:end])
+            position_chunks.append(flat_positions[start:end])
+            effective_lengths.append(end - start)
+
+        if len(set(effective_lengths)) != 1:
+            raise ValueError(
+                "DSpark currently requires uniform effective per-request "
+                "target context lengths after rejection trimming; got "
+                f"{effective_lengths}."
+            )
+
+        return torch.cat(hidden_chunks, dim=0), torch.cat(position_chunks, dim=0)
 
     def _warmup_drafts(self, batch_size: int) -> torch.Tensor:
         self._last_draft_lengths = [self.num_speculative_tokens] * batch_size
@@ -312,6 +385,31 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self._last_draft_lengths = None
         return lengths
 
+    def take_last_draft_probs(self) -> torch.Tensor | None:
+        draft_probs = self._last_draft_probs
+        self._last_draft_probs = None
+        return draft_probs
+
+    def _maybe_store_draft_probs(
+        self,
+        draft_logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        batch_size: int,
+    ) -> None:
+        self._last_draft_probs = None
+        if not getattr(self, "_export_draft_probs", False):
+            return
+        if not sampling_metadata.all_greedy:
+            logger.warning_once(
+                "VLLM_DSPARK_EXPORT_DRAFT_PROBS is currently limited to "
+                "greedy DSpark requests because DSpark non-greedy drafting "
+                "must sample the Markov-corrected block left-to-right."
+            )
+            return
+        self._last_draft_probs = draft_logits[
+            :batch_size, : self.num_speculative_tokens
+        ].softmax(dim=-1, dtype=torch.float32)
+
     @override
     @torch.inference_mode()
     def propose(
@@ -332,13 +430,17 @@ class DSparkProposer(SpecDecodeBaseProposer):
         del (
             target_token_ids,
             token_indices_to_sample,
-            common_attn_metadata,
-            sampling_metadata,
             mm_embed_inputs,
-            num_rejected_tokens_gpu,
             slot_mappings,
         )
+        self._last_draft_probs = None
         batch_size = self._batch_size(next_token_ids)
+        target_hidden_states, target_positions = self._trim_rejected_target_context(
+            target_hidden_states,
+            target_positions,
+            common_attn_metadata,
+            num_rejected_tokens_gpu,
+        )
         hidden_by_req = self._view_by_request(target_hidden_states, batch_size)
         positions_by_req = self._positions_by_request(target_positions, batch_size)
 
@@ -369,7 +471,10 @@ class DSparkProposer(SpecDecodeBaseProposer):
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             batch_descriptor=batch_descriptor,
         ):
-            draft_token_ids, confidence = self._run_draft_for_current_context()
+            draft_token_ids, draft_logits, confidence = (
+                self._run_draft_for_current_context()
+            )
+        self._maybe_store_draft_probs(draft_logits, sampling_metadata, batch_size)
         if confidence is not None:
             self._last_draft_lengths = self._observe_confidence(
                 confidence[:batch_size]
