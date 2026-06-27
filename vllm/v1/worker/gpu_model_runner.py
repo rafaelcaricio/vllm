@@ -6764,6 +6764,7 @@ class GPUModelRunner(
         if self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_extract_hidden_states()
+            or self.speculative_config.use_dspark()
         ):
             assert isinstance(
                 self.drafter,

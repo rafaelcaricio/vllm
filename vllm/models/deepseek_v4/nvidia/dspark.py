@@ -48,6 +48,7 @@ from vllm.v1.spec_decode.dspark import (
     unpack_mhc_pre_outputs,
 )
 
+from .dspark_kernels import dspark_sparse_attention
 from .model import (
     DeepseekV4MoE,
     make_deepseek_v4_expert_params_mapping,
@@ -97,6 +98,7 @@ class DeepSeekV4DSparkAttention(nn.Module):
         self.n_groups = config.o_groups
         self.n_local_groups = self.n_groups // tp_size
         self.window_size = config.sliding_window
+        self.block_size = config.dspark_block_size
         self.eps = config.rms_norm_eps
         self.softmax_scale = self.head_dim**-0.5
         cap = current_platform.get_device_capability()
@@ -176,6 +178,18 @@ class DeepSeekV4DSparkAttention(nn.Module):
             ),
             persistent=False,
         )
+        self.register_buffer(
+            "sparse_scores",
+            torch.empty(
+                max_batch_size,
+                self.block_size,
+                self.n_local_heads,
+                self.window_size + self.block_size,
+                dtype=torch.float32,
+                device=current_platform.device_type,
+            ),
+            persistent=False,
+        )
 
     def _project_kv(
         self,
@@ -223,43 +237,6 @@ class DeepSeekV4DSparkAttention(nn.Module):
         kv, _ = self.rotary_emb(positions, kv.unsqueeze(1), None)
         return q, kv.squeeze(1)
 
-    def _sparse_attn_torch(
-        self,
-        q: torch.Tensor,
-        kv: torch.Tensor,
-        valid_main_lengths: torch.Tensor,
-    ) -> torch.Tensor:
-        batch_size, block_size, num_heads, head_dim = q.shape
-        outputs: list[torch.Tensor] = []
-        for batch_idx in range(batch_size):
-            main_len = int(valid_main_lengths[batch_idx].item())
-            main_len = max(1, min(main_len, self.window_size))
-            kv_row = torch.cat(
-                [
-                    self.main_kv_cache[batch_idx, :main_len],
-                    kv[batch_idx],
-                ],
-                dim=0,
-            )
-            scores = torch.einsum(
-                "qhd,kd->qhk",
-                q[batch_idx].float(),
-                kv_row.float(),
-            )
-            scores.mul_(self.softmax_scale)
-            scores_max = scores.max(dim=-1, keepdim=True).values
-            exp_scores = torch.exp(scores - scores_max)
-            sink = torch.exp(
-                self.attn_sink[:num_heads].view(1, num_heads, 1) - scores_max
-            )
-            denom = exp_scores.sum(dim=-1, keepdim=True) + sink
-            attn = exp_scores / denom
-            out = torch.einsum("qhk,kd->qhd", attn.to(kv_row.dtype), kv_row)
-            outputs.append(out)
-        return torch.stack(outputs, dim=0).reshape(
-            batch_size * block_size, num_heads, head_dim
-        )
-
     def forward_dspark(
         self,
         hidden_states: torch.Tensor,
@@ -281,7 +258,15 @@ class DeepSeekV4DSparkAttention(nn.Module):
             torch.full_like(current_positions, self.window_size),
         )
 
-        out = self._sparse_attn_torch(q, draft_kv, valid_main_lengths).to(self.dtype)
+        out = dspark_sparse_attention(
+            q,
+            draft_kv,
+            self.main_kv_cache,
+            valid_main_lengths,
+            self.attn_sink,
+            self.softmax_scale,
+            self.sparse_scores[:batch_size, :block_size],
+        ).to(self.dtype)
         out_fp8, out_scale = fused_inv_rope_fp8_quant(
             out,
             positions,
@@ -689,6 +674,21 @@ class DeepSeekV4DSpark(nn.Module):
         )
         self._last_confidence = confidence
         return draft_ids
+
+    def draft_with_confidence(
+        self,
+        input_ids: torch.Tensor,
+        main_hidden: torch.Tensor,
+        main_positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        draft_ids, _logits, confidence = self.model.draft(
+            input_ids,
+            main_hidden,
+            main_positions,
+            self.lm_head,
+            self.logits_processor,
+        )
+        return draft_ids, confidence
 
     def take_last_confidence(self) -> torch.Tensor | None:
         confidence = self._last_confidence

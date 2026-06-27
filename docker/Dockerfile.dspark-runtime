@@ -11,6 +11,7 @@ COPY vllm/model_executor/models/registry.py ${VLLM_SITE}/model_executor/models/r
 COPY vllm/models/deepseek_v4/__init__.py ${VLLM_SITE}/models/deepseek_v4/__init__.py
 COPY vllm/models/deepseek_v4/nvidia/model.py ${VLLM_SITE}/models/deepseek_v4/nvidia/model.py
 COPY vllm/models/deepseek_v4/nvidia/dspark.py ${VLLM_SITE}/models/deepseek_v4/nvidia/dspark.py
+COPY vllm/models/deepseek_v4/nvidia/dspark_kernels.py ${VLLM_SITE}/models/deepseek_v4/nvidia/dspark_kernels.py
 COPY vllm/v1/spec_decode/dspark.py ${VLLM_SITE}/v1/spec_decode/dspark.py
 COPY vllm/v1/spec_decode/dspark_proposer.py ${VLLM_SITE}/v1/spec_decode/dspark_proposer.py
 COPY vllm/v1/worker/gpu_model_runner.py ${VLLM_SITE}/v1/worker/gpu_model_runner.py

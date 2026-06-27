@@ -11,6 +11,10 @@ import torch
 from transformers import PretrainedConfig
 
 from vllm.config.speculative import SpeculativeConfig
+from vllm.models.deepseek_v4.nvidia.dspark_kernels import (
+    dspark_sparse_attention,
+    dspark_sparse_attention_torch,
+)
 from vllm.v1.spec_decode.dspark import (
     DSparkDiagnostics,
     DSparkModelSpec,
@@ -281,6 +285,222 @@ def test_make_dspark_warmup_draft_token_ids_rejects_placeholder_token() -> None:
         )
 
 
+def _manual_dspark_sparse_attention(
+    q: torch.Tensor,
+    draft_kv: torch.Tensor,
+    main_kv_cache: torch.Tensor,
+    valid_main_lengths: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    batch_size, block_size, num_heads, head_dim = q.shape
+    rows = []
+    for batch_idx in range(batch_size):
+        main_len = int(valid_main_lengths[batch_idx].item())
+        kv = torch.cat(
+            [
+                main_kv_cache[batch_idx, :main_len],
+                draft_kv[batch_idx],
+            ],
+            dim=0,
+        )
+        scores = torch.einsum("qhd,kd->qhk", q[batch_idx].float(), kv.float())
+        scores.mul_(softmax_scale)
+        normalizer = torch.maximum(
+            scores.max(dim=-1, keepdim=True).values,
+            attn_sink[:num_heads].view(1, num_heads, 1),
+        )
+        weights = torch.exp(scores - normalizer)
+        denom = weights.sum(dim=-1, keepdim=True) + torch.exp(
+            attn_sink[:num_heads].view(1, num_heads, 1) - normalizer
+        )
+        out = torch.einsum("qhk,kd->qhd", weights.to(kv.dtype), kv) / denom.to(
+            kv.dtype
+        )
+        rows.append(out)
+    return torch.stack(rows, dim=0).reshape(
+        batch_size * block_size, num_heads, head_dim
+    )
+
+
+def test_dspark_sparse_attention_reference_matches_manual_window_semantics() -> None:
+    batch_size = 2
+    block_size = 3
+    num_heads = 2
+    head_dim = 4
+    window_size = 5
+    q = torch.arange(
+        batch_size * block_size * num_heads * head_dim,
+        dtype=torch.float32,
+    ).view(batch_size, block_size, num_heads, head_dim)
+    q = (q / 17.0).to(torch.float32)
+    draft_kv = torch.arange(
+        batch_size * block_size * head_dim,
+        dtype=torch.float32,
+    ).view(batch_size, block_size, head_dim)
+    draft_kv = (draft_kv / 13.0).to(torch.float32)
+    main_kv_cache = torch.arange(
+        batch_size * window_size * head_dim,
+        dtype=torch.float32,
+    ).view(batch_size, window_size, head_dim)
+    main_kv_cache = (main_kv_cache / 11.0).to(torch.float32)
+    valid_main_lengths = torch.tensor([2, 5], dtype=torch.int64)
+    attn_sink = torch.tensor([-0.25, 0.5], dtype=torch.float32)
+
+    actual = dspark_sparse_attention_torch(
+        q,
+        draft_kv,
+        main_kv_cache,
+        valid_main_lengths,
+        attn_sink,
+        softmax_scale=0.125,
+    )
+    expected = _manual_dspark_sparse_attention(
+        q,
+        draft_kv,
+        main_kv_cache,
+        valid_main_lengths,
+        attn_sink,
+        softmax_scale=0.125,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_dspark_sparse_attention_triton_matches_reference() -> None:
+    device = torch.device("cuda")
+    batch_size = 2
+    block_size = 5
+    num_heads = 4
+    head_dim = 64
+    window_size = 9
+    generator = torch.Generator(device=device).manual_seed(123)
+    q = torch.randn(
+        batch_size,
+        block_size,
+        num_heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    draft_kv = torch.randn(
+        batch_size,
+        block_size,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    main_kv_cache = torch.randn(
+        batch_size,
+        window_size,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    valid_main_lengths = torch.tensor(
+        [3, window_size], device=device, dtype=torch.int64
+    )
+    attn_sink = torch.randn(num_heads, device=device, dtype=torch.float32)
+    scores = torch.empty(
+        batch_size,
+        block_size,
+        num_heads,
+        window_size + block_size,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    actual = dspark_sparse_attention(
+        q,
+        draft_kv,
+        main_kv_cache,
+        valid_main_lengths,
+        attn_sink,
+        softmax_scale=head_dim**-0.5,
+        scores_buffer=scores,
+    )
+    expected = dspark_sparse_attention_torch(
+        q,
+        draft_kv,
+        main_kv_cache,
+        valid_main_lengths,
+        attn_sink,
+        softmax_scale=head_dim**-0.5,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_dspark_sparse_attention_triton_is_cuda_graph_safe() -> None:
+    device = torch.device("cuda")
+    batch_size = 1
+    block_size = 5
+    num_heads = 2
+    head_dim = 64
+    window_size = 8
+    q = torch.randn(
+        batch_size, block_size, num_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    draft_kv = torch.randn(
+        batch_size, block_size, head_dim, device=device, dtype=torch.bfloat16
+    )
+    main_kv_cache = torch.randn(
+        batch_size, window_size, head_dim, device=device, dtype=torch.bfloat16
+    )
+    valid_main_lengths = torch.tensor([window_size], device=device, dtype=torch.int64)
+    attn_sink = torch.randn(num_heads, device=device, dtype=torch.float32)
+    scores = torch.empty(
+        batch_size,
+        block_size,
+        num_heads,
+        window_size + block_size,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    for _ in range(3):
+        dspark_sparse_attention(
+            q,
+            draft_kv,
+            main_kv_cache,
+            valid_main_lengths,
+            attn_sink,
+            softmax_scale=head_dim**-0.5,
+            scores_buffer=scores,
+        )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = dspark_sparse_attention(
+            q,
+            draft_kv,
+            main_kv_cache,
+            valid_main_lengths,
+            attn_sink,
+            softmax_scale=head_dim**-0.5,
+            scores_buffer=scores,
+        )
+    eager = dspark_sparse_attention(
+        q,
+        draft_kv,
+        main_kv_cache,
+        valid_main_lengths,
+        attn_sink,
+        softmax_scale=head_dim**-0.5,
+        scores_buffer=scores,
+    )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(captured, eager, rtol=3e-2, atol=3e-2)
+
+
 def test_dspark_proposer_wraps_draft_in_forward_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -307,6 +527,7 @@ def test_dspark_proposer_wraps_draft_in_forward_context(
         _vllm_config: object,
         *,
         num_tokens: int,
+        **_kwargs: object,
     ) -> FakeForwardContext:
         return FakeForwardContext(num_tokens)
 
@@ -334,6 +555,24 @@ def test_dspark_proposer_wraps_draft_in_forward_context(
         dspark_proposer_module,
         "set_forward_context",
         fake_set_forward_context,
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_determine_graph_batch",
+        lambda _self, batch_size: (None, batch_size, None, None),
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_prepare_draft_buffers",
+        lambda _self, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_run_draft_for_current_context",
+        lambda _self: (
+            torch.full((2, 5), 7, dtype=torch.long),
+            None,
+        ),
     )
 
     proposer = DSparkProposer.__new__(DSparkProposer)

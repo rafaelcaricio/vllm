@@ -8,8 +8,9 @@ from typing import Any
 import torch
 from typing_extensions import override
 
+from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -53,6 +54,24 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self.noise_token_id = int(hf_config.dspark_noise_token_id)
         self._prefilled = False
         self._runner = runner
+        self._draft_graph_runner: CUDAGraphWrapper | None = None
+        self._draft_graph_batch_size = 0
+        self._draft_input_ids_buffer = torch.zeros(
+            self.max_batch_size,
+            dtype=torch.long,
+            device=device,
+        )
+        self._draft_hidden_buffer = torch.zeros(
+            self.max_batch_size,
+            self.target_hidden_size,
+            dtype=self.dtype,
+            device=device,
+        )
+        self._draft_positions_buffer = torch.zeros(
+            self.max_batch_size,
+            dtype=torch.long,
+            device=device,
+        )
         self.diagnostics = DSparkDiagnostics(
             max_spec_tokens=self.num_speculative_tokens
         )
@@ -74,11 +93,125 @@ class DSparkProposer(SpecDecodeBaseProposer):
         is_graph_capturing: bool = False,
         slot_mappings: dict[str, torch.Tensor] | None = None,
     ) -> None:
-        del num_tokens, use_cudagraphs, is_graph_capturing, slot_mappings
+        del is_graph_capturing, slot_mappings
+        batch_size = max(1, min(int(num_tokens), self.max_batch_size))
+        (
+            cudagraph_runtime_mode,
+            padded_batch_size,
+            num_tokens_across_dp,
+            batch_descriptor,
+        ) = self._determine_graph_batch(batch_size, use_cudagraphs=use_cudagraphs)
+        self._prepare_draft_buffers(
+            input_ids=torch.zeros(batch_size, dtype=torch.long, device=self.device),
+            hidden_states=torch.zeros(
+                batch_size,
+                self.target_hidden_size,
+                dtype=self.dtype,
+                device=self.device,
+            ),
+            positions=torch.arange(batch_size, dtype=torch.long, device=self.device),
+            padded_batch_size=padded_batch_size,
+        )
+        with set_forward_context(
+            None,
+            self.vllm_config,
+            num_tokens=padded_batch_size * self.num_speculative_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
+        ):
+            self._run_draft_for_current_context()
 
     @override
     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
-        del cudagraph_mode
+        if (
+            not self.speculative_config.enforce_eager
+            and cudagraph_mode.mixed_mode()
+            in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
+        ):
+            dspark_cudagraph_mode = CUDAGraphMode.PIECEWISE
+        else:
+            dspark_cudagraph_mode = CUDAGraphMode.NONE
+        self.cudagraph_dispatcher.initialize_cudagraph_keys(dspark_cudagraph_mode)
+        if dspark_cudagraph_mode != CUDAGraphMode.NONE and self.device.type == "cuda":
+            self._draft_graph_runner = CUDAGraphWrapper(
+                self._run_draft_from_buffers,
+                self.vllm_config,
+                runtime_mode=CUDAGraphMode.PIECEWISE,
+            )
+
+    def _determine_graph_batch(
+        self,
+        batch_size: int,
+        *,
+        use_cudagraphs: bool = True,
+    ) -> tuple[CUDAGraphMode, int, torch.Tensor | None, BatchDescriptor]:
+        cudagraph_mode, batch_descriptor = self.cudagraph_dispatcher.dispatch(
+            batch_size,
+            valid_modes=({CUDAGraphMode.NONE} if not use_cudagraphs else None),
+        )
+        padded_batch_size = batch_descriptor.num_tokens
+        num_tokens_across_dp = None
+        if self.vllm_config.parallel_config.data_parallel_size > 1:
+            from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
+
+            should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
+                coordinate_batch_across_dp(
+                    num_tokens_unpadded=batch_size,
+                    parallel_config=self.vllm_config.parallel_config,
+                    allow_microbatching=False,
+                    num_tokens_padded=padded_batch_size,
+                    cudagraph_mode=cudagraph_mode.value,
+                )
+            )
+            assert not should_ubatch, "DBO ubatching not implemented for DSpark"
+            if num_tokens_across_dp is not None:
+                dp_rank = self.dp_rank
+                padded_batch_size = int(num_tokens_across_dp[dp_rank].item())
+                cudagraph_mode, batch_descriptor = self.cudagraph_dispatcher.dispatch(
+                    padded_batch_size,
+                    valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
+                )
+                assert batch_descriptor.num_tokens == padded_batch_size
+                num_tokens_across_dp[dp_rank] = padded_batch_size
+        return (
+            cudagraph_mode,
+            padded_batch_size,
+            num_tokens_across_dp,
+            batch_descriptor,
+        )
+
+    def _prepare_draft_buffers(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        padded_batch_size: int,
+    ) -> None:
+        batch_size = input_ids.shape[0]
+        self._draft_graph_batch_size = padded_batch_size
+        self._draft_input_ids_buffer[:batch_size].copy_(input_ids.to(torch.long))
+        self._draft_hidden_buffer[:batch_size].copy_(hidden_states.to(self.dtype))
+        self._draft_positions_buffer[:batch_size].copy_(positions.to(torch.long))
+        if padded_batch_size > batch_size:
+            pad_slice = slice(batch_size, padded_batch_size)
+            self._draft_input_ids_buffer[pad_slice].fill_(self.noise_token_id)
+            self._draft_hidden_buffer[pad_slice].zero_()
+            self._draft_positions_buffer[pad_slice].zero_()
+
+    def _run_draft_from_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = self._draft_graph_batch_size
+        return self.model.draft_with_confidence(
+            self._draft_input_ids_buffer[:batch_size],
+            self._draft_hidden_buffer[:batch_size],
+            self._draft_positions_buffer[:batch_size],
+        )
+
+    def _run_draft_for_current_context(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._draft_graph_runner is not None:
+            return self._draft_graph_runner()
+        return self._run_draft_from_buffers()
 
     def _batch_size(self, next_token_ids: torch.Tensor) -> int:
         return int(next_token_ids.shape[0])
@@ -164,20 +297,32 @@ class DSparkProposer(SpecDecodeBaseProposer):
 
         last_hidden = hidden_by_req[:, -1].contiguous()
         last_positions = positions_by_req[:, -1].contiguous()
+        (
+            cudagraph_runtime_mode,
+            padded_batch_size,
+            num_tokens_across_dp,
+            batch_descriptor,
+        ) = self._determine_graph_batch(batch_size)
+        self._prepare_draft_buffers(
+            input_ids=next_token_ids,
+            hidden_states=last_hidden,
+            positions=last_positions,
+            padded_batch_size=padded_batch_size,
+        )
         with set_forward_context(
             None,
             self.vllm_config,
-            num_tokens=batch_size * self.num_speculative_tokens,
+            num_tokens=padded_batch_size * self.num_speculative_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
         ):
-            draft_token_ids = self.model.draft(
-                next_token_ids.to(torch.long),
-                last_hidden,
-                last_positions,
-            )
-        confidence = self.model.take_last_confidence()
+            draft_token_ids, confidence = self._run_draft_for_current_context()
         if confidence is not None:
-            self._observe_confidence(confidence)
-        return draft_token_ids[:, : self.num_speculative_tokens].to(torch.int32)
+            self._observe_confidence(confidence[:batch_size])
+        return draft_token_ids[:batch_size, : self.num_speculative_tokens].to(
+            torch.int32
+        )
 
     def get_diagnostics_snapshot(self) -> Any:
         return self.diagnostics.snapshot()
