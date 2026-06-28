@@ -1508,6 +1508,177 @@ def test_dspark_proposer_gpu_mask_anchors_on_last_non_rejected_token(
     assert DSparkProposer.take_last_draft_lengths(proposer) == [5]
 
 
+def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.spec_decode.dspark_proposer as dspark_proposer_module
+
+    class AttentionMetadataStub:
+        query_start_loc_cpu = torch.tensor([0, 415, 421], dtype=torch.int32)
+        query_start_loc = query_start_loc_cpu
+
+    class FakeForwardContext:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    captured_prefill: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = []
+    captured_draft: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    class FakeDSparkModel:
+        def prefill_main(
+            self,
+            hidden_by_req: torch.Tensor,
+            positions_by_req: torch.Tensor,
+            *,
+            num_rejected_tokens: torch.Tensor | None = None,
+        ) -> None:
+            captured_prefill.append(
+                (
+                    hidden_by_req.detach().clone(),
+                    positions_by_req.detach().clone(),
+                    None
+                    if num_rejected_tokens is None
+                    else num_rejected_tokens.detach().clone(),
+                )
+            )
+
+    def capture_draft_buffers(
+        _self: DSparkProposer,
+        *,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        padded_batch_size: int,
+    ) -> None:
+        del input_ids, padded_batch_size
+        captured_draft.append(
+            (hidden_states.detach().clone(), positions.detach().clone())
+        )
+
+    monkeypatch.setattr(
+        dspark_proposer_module,
+        "set_forward_context",
+        lambda *_args, **_kwargs: FakeForwardContext(),
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_determine_graph_batch",
+        lambda _self, batch_size: (None, batch_size, None, None),
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_prepare_draft_buffers",
+        capture_draft_buffers,
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_run_draft_for_current_context",
+        lambda _self: (
+            torch.full((2, 5), 9, dtype=torch.long),
+            torch.empty(0, 0, 0),
+            torch.empty(2, 0),
+        ),
+    )
+
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.vllm_config = object()
+    proposer.device = torch.device("cpu")
+    proposer.num_speculative_tokens = 5
+    proposer.confidence_threshold = 0.0
+    proposer._collect_confidence_diagnostics = False
+    proposer._collect_position0_diagnostics = False
+    proposer._export_draft_probs = False
+    proposer._last_draft_probs = None
+    proposer._last_confidence = None
+    proposer._last_draft_lengths = None
+    proposer._gpu_rejected_context_mask = True
+    proposer._multi_seq_pad = True
+    proposer._prefilled = True
+    proposer.model = FakeDSparkModel()
+
+    hidden = torch.arange(421 * 3, dtype=torch.float32).reshape(421, 3)
+    positions = torch.cat(
+        [
+            torch.arange(415, dtype=torch.long),
+            torch.arange(669, 675, dtype=torch.long),
+        ]
+    )
+
+    draft_ids = DSparkProposer.propose(
+        proposer,
+        target_token_ids=torch.empty(2, dtype=torch.long),
+        target_positions=positions,
+        target_hidden_states=hidden,
+        next_token_ids=torch.tensor([21, 22], dtype=torch.int32),
+        token_indices_to_sample=None,
+        common_attn_metadata=AttentionMetadataStub(),  # type: ignore[arg-type]
+        sampling_metadata=None,  # type: ignore[arg-type]
+        num_rejected_tokens_gpu=torch.tensor([0, 0], dtype=torch.int32),
+    )
+
+    assert len(captured_prefill) == 2
+    long_hidden, long_positions, long_rejected = captured_prefill[0]
+    assert long_hidden.shape == (2, 415, 3)
+    torch.testing.assert_close(long_hidden[0], hidden[:415])
+    torch.testing.assert_close(long_hidden[1], torch.zeros_like(long_hidden[1]))
+    torch.testing.assert_close(long_positions[0], positions[:415])
+    torch.testing.assert_close(long_positions[1], torch.zeros_like(long_positions[1]))
+    assert long_rejected is not None
+    assert long_rejected.tolist() == [0, 415]
+
+    short_hidden, short_positions, short_rejected = captured_prefill[1]
+    assert short_hidden.shape == (2, 6, 3)
+    torch.testing.assert_close(short_hidden[0], torch.zeros_like(short_hidden[0]))
+    torch.testing.assert_close(short_hidden[1], hidden[415:421])
+    torch.testing.assert_close(short_positions[0], torch.zeros_like(short_positions[0]))
+    torch.testing.assert_close(short_positions[1], positions[415:421])
+    assert short_rejected is not None
+    assert short_rejected.tolist() == [6, 0]
+
+    assert len(captured_draft) == 1
+    draft_hidden, draft_positions = captured_draft[0]
+    torch.testing.assert_close(draft_hidden, torch.stack([hidden[414], hidden[420]]))
+    torch.testing.assert_close(draft_positions, torch.tensor([414, 674]))
+    assert draft_ids.tolist() == [[9, 9, 9, 9, 9], [9, 9, 9, 9, 9]]
+    assert DSparkProposer.take_last_draft_lengths(proposer) == [5, 5]
+
+
+def test_dspark_attention_store_main_kv_can_skip_fully_masked_rows() -> None:
+    dspark_module = _dspark_model_module()
+    attn = dspark_module.DeepSeekV4DSparkAttention.__new__(
+        dspark_module.DeepSeekV4DSparkAttention
+    )
+    torch.nn.Module.__init__(attn)
+    attn.window_size = 4
+    attn.hidden_size = 2
+    attn.head_dim = 2
+    original_cache = torch.arange(2 * 4 * 2, dtype=torch.float32).reshape(2, 4, 2)
+    attn.main_kv_cache = original_cache.clone()
+    attn._project_kv = lambda hidden_states, _positions: hidden_states
+
+    main_x = torch.tensor(
+        [
+            [[100.0, 101.0], [102.0, 103.0], [104.0, 105.0]],
+            [[200.0, 201.0], [202.0, 203.0], [204.0, 205.0]],
+        ]
+    )
+    main_positions = torch.tensor([[0, 1, 2], [0, 1, 2]], dtype=torch.long)
+
+    dspark_module.DeepSeekV4DSparkAttention.store_main_kv(
+        attn,
+        main_x,
+        main_positions,
+        num_rejected_tokens=torch.tensor([0, 3], dtype=torch.int32),
+    )
+
+    expected = original_cache.clone()
+    expected[0, 0:3] = main_x[0]
+    torch.testing.assert_close(attn.main_kv_cache, expected)
+
+
 def test_dspark_proposer_confidence_threshold_sets_prefix_lengths() -> None:
     proposer = DSparkProposer.__new__(DSparkProposer)
     proposer.num_speculative_tokens = 5

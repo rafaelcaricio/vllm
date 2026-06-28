@@ -20,9 +20,13 @@ production branch.
   instead of participating in vLLM's normal KV-cache allocator. This matches the
   reference DSpark shape better, but it needs stronger reset/reorder handling for
   batching, preemption, and long-running mixed workloads.
-- The proposer currently assumes uniform flattened per-request target features
-  when reshaping target hidden states by batch. Single-stream benchmarking is
-  covered; heterogeneous batches need a ragged path.
+- The proposer now handles ragged mixed prefill+decode target batches by
+  grouping requests with equal target-context lengths and masking placeholder
+  rows. This fixes the former uniform-reshape crash, but it is still a Python
+  grouping path that reads small query/rejection metadata on CPU and performs
+  dummy projection work for placeholder rows. A production path should move this
+  to lower-overhead GPU-side metadata handling or a DSpark-specific ragged
+  main-KV update API.
 - The first post-prefill draft call warms DSpark's main-token cache from the
   prompt, then returns a synthetic draft tensor filled with the configured
   DSpark noise token. This keeps vLLM's async speculative path type-stable and
@@ -155,6 +159,9 @@ production branch.
 - TODO P1: add warmup coverage for inference-time JIT gaps observed on the real
   server: request-prep metadata, route packing, EAGLE-named speculative prep,
   and rejection greedy sampling.
+- TODO P1: replace the mixed prefill+decode Python grouping path with a
+  kernel-native or model-native ragged `prefill_main` update that preserves
+  request row identity without full-batch placeholder rows.
 - TODO P1: add FlashInfer sparse MLA tuning buckets for DSpark decode and graph
   capture shapes that currently fall back to tactic `-1`.
 - TODO P1: implement a fused DSpark sparse-attention kernel that combines score

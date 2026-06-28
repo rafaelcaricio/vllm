@@ -102,6 +102,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self._gpu_rejected_context_mask = (
             self._read_gpu_rejected_context_mask()
         )
+        self._multi_seq_pad = self._read_multi_seq_pad()
         self._stage_timing = self._read_stage_timing()
         self._stage_timing_log_every = self._read_stage_timing_log_every()
         self._stage_timing_count = 0
@@ -294,6 +295,11 @@ class DSparkProposer(SpecDecodeBaseProposer):
         return raw.strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
+    def _read_multi_seq_pad() -> bool:
+        raw = os.getenv("VLLM_DSPARK_MULTI_SEQ_PAD", "0")
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
     def _read_stage_timing_log_every() -> int:
         raw = os.getenv("VLLM_DSPARK_STAGE_TIMING_LOG_EVERY", "20")
         try:
@@ -306,6 +312,8 @@ class DSparkProposer(SpecDecodeBaseProposer):
         return max(1, value)
 
     def _record_stage_timing(self, name: str, elapsed_ms: float) -> None:
+        if not hasattr(self, "_stage_timing_totals_ms"):
+            self._stage_timing_totals_ms = {}
         self._stage_timing_totals_ms[name] = (
             self._stage_timing_totals_ms.get(name, 0.0) + float(elapsed_ms)
         )
@@ -576,13 +584,260 @@ class DSparkProposer(SpecDecodeBaseProposer):
             effective_lengths.append(end - start)
 
         if len(set(effective_lengths)) != 1:
-            raise ValueError(
-                "DSpark currently requires uniform effective per-request "
-                "target context lengths after rejection trimming; got "
-                f"{effective_lengths}."
-            )
+            if not getattr(self, "_multi_seq_pad", False):
+                raise ValueError(
+                    "DSpark currently requires uniform effective per-request "
+                    "target context lengths after rejection trimming; got "
+                    f"{effective_lengths}. Set VLLM_DSPARK_MULTI_SEQ_PAD=1 "
+                    "to pad shorter requests to the max length."
+                )
+            # Pad shorter chunks to the max effective length by repeating the
+            # last valid hidden state. This keeps the downstream uniform-batch
+            # contract (prefill_main / store_main_kv / forward_dspark) intact
+            # at the cost of a minor per-request context artifact (the draft
+            # sees a repeated token in its windowed KV cache). Single-stream
+            # is unaffected (one request => trivially uniform => no padding).
+            max_len = max(effective_lengths)
+            for i in range(len(hidden_chunks)):
+                pad = max_len - effective_lengths[i]
+                if pad > 0:
+                    hidden_chunks[i] = torch.cat(
+                        [hidden_chunks[i], hidden_chunks[i][-1:].repeat(pad, 1)]
+                    )
+                    position_chunks[i] = torch.cat(
+                        [position_chunks[i], position_chunks[i][-1:].repeat(pad)]
+                    )
+                    effective_lengths[i] = max_len
 
         return torch.cat(hidden_chunks, dim=0), torch.cat(position_chunks, dim=0)
+
+    def _query_starts_cpu(
+        self,
+        common_attn_metadata: CommonAttentionMetadata | None,
+        batch_size: int,
+        num_target_rows: int,
+    ) -> list[int] | None:
+        if common_attn_metadata is None:
+            return None
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        if query_start_loc_cpu is None:
+            query_start_loc_cpu = common_attn_metadata.query_start_loc.detach().cpu()
+        query_starts = [int(value) for value in query_start_loc_cpu.tolist()]
+        if len(query_starts) != batch_size + 1:
+            raise ValueError(
+                "DSpark target context batching requires query_start_loc to "
+                "have batch_size + 1 entries; got "
+                f"{len(query_starts)} starts for {batch_size} requests."
+            )
+        if query_starts[0] != 0 or query_starts[-1] != num_target_rows:
+            raise ValueError(
+                "DSpark target context batching received inconsistent "
+                f"query_start_loc={query_starts} for {num_target_rows} rows."
+            )
+        return query_starts
+
+    def _rejected_counts_cpu(
+        self,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        batch_size: int,
+    ) -> list[int]:
+        if num_rejected_tokens_gpu is None:
+            return [0] * batch_size
+        rejected = [
+            int(value)
+            for value in num_rejected_tokens_gpu.detach().cpu().reshape(-1).tolist()
+        ]
+        if len(rejected) != batch_size:
+            raise ValueError(
+                "DSpark rejected-token metadata must have one value per "
+                f"request; got {len(rejected)} values for batch_size={batch_size}."
+            )
+        return rejected
+
+    def _prepare_target_context_batches(
+        self,
+        target_hidden_states: torch.Tensor,
+        target_positions: torch.Tensor,
+        common_attn_metadata: CommonAttentionMetadata | None,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        batch_size: int,
+    ) -> tuple[
+        list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]],
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Build DSpark main-cache update batches while preserving request rows."""
+        use_gpu_rejected_mask = (
+            getattr(self, "_gpu_rejected_context_mask", False)
+            and num_rejected_tokens_gpu is not None
+        )
+        rejected_for_gpu_mask = (
+            num_rejected_tokens_gpu if use_gpu_rejected_mask else None
+        )
+        query_starts = self._query_starts_cpu(
+            common_attn_metadata,
+            batch_size,
+            int(target_hidden_states.shape[0]),
+        )
+
+        if query_starts is None:
+            if not use_gpu_rejected_mask:
+                target_hidden_states, target_positions = (
+                    self._trim_rejected_target_context(
+                        target_hidden_states,
+                        target_positions,
+                        common_attn_metadata,
+                        num_rejected_tokens_gpu,
+                    )
+                )
+            hidden_by_req = self._view_by_request(target_hidden_states, batch_size)
+            positions_by_req = self._positions_by_request(
+                target_positions,
+                batch_size,
+            )
+
+            if rejected_for_gpu_mask is not None:
+                rejected = rejected_for_gpu_mask.to(
+                    device=hidden_by_req.device,
+                    dtype=torch.long,
+                    non_blocking=True,
+                ).view(batch_size)
+                last_indices = (hidden_by_req.shape[1] - rejected - 1).clamp(min=0)
+                last_hidden = hidden_by_req.gather(
+                    1,
+                    last_indices.view(batch_size, 1, 1).expand(
+                        -1,
+                        -1,
+                        hidden_by_req.shape[-1],
+                    ),
+                ).squeeze(1).contiguous()
+                last_positions = positions_by_req.gather(
+                    1,
+                    last_indices.view(batch_size, 1),
+                ).squeeze(1).contiguous()
+            else:
+                last_hidden = hidden_by_req[:, -1].contiguous()
+                last_positions = positions_by_req[:, -1].contiguous()
+            return (
+                [(hidden_by_req, positions_by_req, rejected_for_gpu_mask)],
+                last_hidden,
+                last_positions,
+            )
+
+        rejected_counts = self._rejected_counts_cpu(
+            num_rejected_tokens_gpu,
+            batch_size,
+        )
+        flat_positions = target_positions.reshape(-1)
+        hidden_chunks: list[torch.Tensor] = []
+        position_chunks: list[torch.Tensor] = []
+        chunk_lengths: list[int] = []
+        valid_lengths: list[int] = []
+        prefill_rejected_counts: list[int] = []
+
+        for req_index in range(batch_size):
+            start = query_starts[req_index]
+            end = query_starts[req_index + 1]
+            raw_len = end - start
+            num_rejected = int(rejected_counts[req_index])
+            if raw_len <= 0:
+                raise ValueError(
+                    "DSpark target context batching received an empty target "
+                    f"context for request {req_index}."
+                )
+            if num_rejected < 0 or num_rejected >= raw_len:
+                raise ValueError(
+                    "DSpark target context batching requires at least one "
+                    "valid target token per request; got "
+                    f"raw_len={raw_len}, rejected={num_rejected} for "
+                    f"request {req_index}."
+                )
+
+            chunk_end = end if use_gpu_rejected_mask else end - num_rejected
+            chunk = target_hidden_states[start:chunk_end]
+            positions = flat_positions[start:chunk_end]
+            chunk_len = int(chunk.shape[0])
+            valid_len = chunk_len - (num_rejected if use_gpu_rejected_mask else 0)
+            if valid_len <= 0:
+                raise ValueError(
+                    "DSpark target context batching removed every target token "
+                    f"for request {req_index}."
+                )
+
+            hidden_chunks.append(chunk)
+            position_chunks.append(positions)
+            chunk_lengths.append(chunk_len)
+            valid_lengths.append(valid_len)
+            prefill_rejected_counts.append(
+                num_rejected if use_gpu_rejected_mask else 0
+            )
+
+        last_hidden = torch.stack(
+            [
+                hidden_chunks[req_index][valid_lengths[req_index] - 1]
+                for req_index in range(batch_size)
+            ],
+            dim=0,
+        ).contiguous()
+        last_positions = torch.stack(
+            [
+                position_chunks[req_index][valid_lengths[req_index] - 1]
+                for req_index in range(batch_size)
+            ],
+            dim=0,
+        ).contiguous()
+
+        if len(set(chunk_lengths)) == 1:
+            hidden_by_req = torch.stack(hidden_chunks, dim=0).contiguous()
+            positions_by_req = torch.stack(position_chunks, dim=0).contiguous()
+            rejected_for_prefill = (
+                rejected_for_gpu_mask if use_gpu_rejected_mask else None
+            )
+            return (
+                [(hidden_by_req, positions_by_req, rejected_for_prefill)],
+                last_hidden,
+                last_positions,
+            )
+
+        if not getattr(self, "_multi_seq_pad", False):
+            raise ValueError(
+                "DSpark target context batching received ragged per-request "
+                f"context lengths {chunk_lengths}. Set VLLM_DSPARK_MULTI_SEQ_PAD=1 "
+                "to process mixed prefill+decode batches."
+            )
+
+        grouped_lengths: list[int] = []
+        for chunk_len in chunk_lengths:
+            if chunk_len not in grouped_lengths:
+                grouped_lengths.append(chunk_len)
+
+        prefill_batches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]
+        prefill_batches = []
+        for group_len in grouped_lengths:
+            hidden_by_req = target_hidden_states.new_zeros(
+                batch_size,
+                group_len,
+                target_hidden_states.shape[-1],
+            )
+            positions_by_req = flat_positions.new_zeros(batch_size, group_len)
+            rejected_values = [group_len] * batch_size
+            for req_index, chunk_len in enumerate(chunk_lengths):
+                if chunk_len != group_len:
+                    continue
+                hidden_by_req[req_index].copy_(hidden_chunks[req_index])
+                positions_by_req[req_index].copy_(position_chunks[req_index])
+                rejected_values[req_index] = prefill_rejected_counts[req_index]
+
+            rejected_for_prefill = torch.tensor(
+                rejected_values,
+                dtype=torch.int32,
+                device=target_hidden_states.device,
+            )
+            prefill_batches.append(
+                (hidden_by_req, positions_by_req, rejected_for_prefill)
+            )
+
+        return prefill_batches, last_hidden, last_positions
 
     def _warmup_drafts(self, batch_size: int) -> torch.Tensor:
         self._last_draft_lengths = [self.num_speculative_tokens] * batch_size
@@ -737,68 +992,31 @@ class DSparkProposer(SpecDecodeBaseProposer):
         batch_size = self._batch_size(next_token_ids)
 
         def prepare_context():
-            nonlocal target_hidden_states, target_positions
-            rejected_for_gpu_mask = None
-            if (
-                getattr(self, "_gpu_rejected_context_mask", False)
-                and num_rejected_tokens_gpu is not None
-            ):
-                rejected_for_gpu_mask = num_rejected_tokens_gpu
-            else:
-                target_hidden_states, target_positions = (
-                    self._trim_rejected_target_context(
-                        target_hidden_states,
-                        target_positions,
-                        common_attn_metadata,
-                        num_rejected_tokens_gpu,
-                    )
-                )
-            hidden_by_req = self._view_by_request(target_hidden_states, batch_size)
-            positions_by_req = self._positions_by_request(target_positions, batch_size)
-
-            if rejected_for_gpu_mask is not None:
-                rejected = rejected_for_gpu_mask.to(
-                    device=hidden_by_req.device,
-                    dtype=torch.long,
-                    non_blocking=True,
-                ).view(batch_size)
-                last_indices = (
-                    hidden_by_req.shape[1] - rejected - 1
-                ).clamp(min=0)
-                last_hidden = hidden_by_req.gather(
-                    1,
-                    last_indices.view(batch_size, 1, 1).expand(
-                        -1,
-                        -1,
-                        hidden_by_req.shape[-1],
-                    ),
-                ).squeeze(1).contiguous()
-                last_positions = positions_by_req.gather(
-                    1,
-                    last_indices.view(batch_size, 1),
-                ).squeeze(1).contiguous()
-            else:
-                last_hidden = hidden_by_req[:, -1].contiguous()
-                last_positions = positions_by_req[:, -1].contiguous()
-            return hidden_by_req, positions_by_req, last_hidden, last_positions, (
-                rejected_for_gpu_mask
+            return self._prepare_target_context_batches(
+                target_hidden_states,
+                target_positions,
+                common_attn_metadata,
+                num_rejected_tokens_gpu,
+                batch_size,
             )
 
         (
-            hidden_by_req,
-            positions_by_req,
+            prefill_batches,
             last_hidden,
             last_positions,
-            rejected_for_gpu_mask,
         ) = self._timed_stage("context_prepare", prepare_context)
+
+        def prefill_main():
+            for hidden_by_req, positions_by_req, num_rejected in prefill_batches:
+                self.model.prefill_main(
+                    hidden_by_req,
+                    positions_by_req,
+                    num_rejected_tokens=num_rejected,
+                )
 
         self._timed_stage(
             "prefill_main",
-            lambda: self.model.prefill_main(
-                hidden_by_req,
-                positions_by_req,
-                num_rejected_tokens=rejected_for_gpu_mask,
-            ),
+            prefill_main,
         )
         if not self._prefilled:
             self._prefilled = True

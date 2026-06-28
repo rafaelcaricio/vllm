@@ -307,7 +307,7 @@ class DeepSeekV4DSparkAttention(nn.Module):
                 dtype=torch.long,
                 non_blocking=True,
             ).view(batch_size)
-            valid_lengths = (seq_len - rejected).clamp(min=1, max=seq_len)
+            valid_lengths = (seq_len - rejected).clamp(min=0, max=seq_len)
             token_offsets = torch.arange(
                 seq_len,
                 device=main_x.device,
