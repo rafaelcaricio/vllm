@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -175,6 +176,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.dspark import DSparkPosition0Diagnostics
 from vllm.v1.spec_decode.dspark_proposer import DSparkProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
@@ -359,6 +361,10 @@ def _copy_pooler_output_to_cpu(
     return pooler_output
 
 
+def _format_optional_float(value: float | None) -> str:
+    return "nan" if value is None else f"{value:.3f}"
+
+
 class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
         self,
@@ -432,6 +438,21 @@ class GPUModelRunner(
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self._dspark_iter_timing = os.getenv("VLLM_DSPARK_ITER_TIMING", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        try:
+            self._dspark_iter_timing_log_every = max(
+                1, int(os.getenv("VLLM_DSPARK_ITER_TIMING_LOG_EVERY", "20"))
+            )
+        except ValueError:
+            self._dspark_iter_timing_log_every = 20
+        self._dspark_iter_timing_count = 0
+        self._dspark_iter_timing_totals_ms: defaultdict[str, float] = defaultdict(float)
+        self._dspark_iter_timing_started = 0.0
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -440,6 +461,11 @@ class GPUModelRunner(
         self.device = device
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
+        if self._dspark_iter_timing:
+            logger.info(
+                "DSpark iteration timing enabled. CUDA is synchronized around "
+                "measured stages; use for diagnostics only."
+            )
 
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
@@ -830,6 +856,24 @@ class GPUModelRunner(
         self._draft_token_length_req_ids: list[str] | None = None
         self._draft_probs: torch.Tensor | None = None
         self._draft_prob_req_ids: list[str] | None = None
+        self._draft_confidence: torch.Tensor | None = None
+        self._draft_confidence_req_ids: list[str] | None = None
+        self._dspark_position0_diagnostics = (
+            DSparkPosition0Diagnostics()
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.use_dspark()
+                and envs.VLLM_DSPARK_POSITION0_DIAGNOSTICS
+            )
+            else None
+        )
+        self._dspark_position0_log_next = 1
+        if self._dspark_position0_diagnostics is not None:
+            logger.info(
+                "DSpark position-0 quality diagnostics enabled. This copies "
+                "one scalar agreement and optional confidence per request to "
+                "CPU on speculative decode steps."
+            )
         # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
         self._num_valid_draft_tokens: torch.Tensor | None = None
         self._num_valid_draft_tokens_cpu: torch.Tensor | None = None
@@ -3506,6 +3550,10 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
+        self._maybe_observe_dspark_position0_quality(
+            spec_decode_metadata,
+            logits,
+        )
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
@@ -3514,6 +3562,93 @@ class GPUModelRunner(
             sampling_metadata,
         )
         return sampler_output
+
+    def _get_dspark_position0_confidence(
+        self,
+        req_ids: list[str],
+    ) -> torch.Tensor | None:
+        if self._draft_confidence is None or self._draft_confidence_req_ids is None:
+            return None
+
+        row_by_req_id = {
+            req_id: idx for idx, req_id in enumerate(self._draft_confidence_req_ids)
+        }
+        confidence_rows: list[torch.Tensor] = []
+        for req_id in req_ids:
+            row_idx = row_by_req_id.get(req_id)
+            if row_idx is None:
+                return None
+            confidence_rows.append(self._draft_confidence[row_idx, 0])
+        if not confidence_rows:
+            return None
+        return torch.stack(confidence_rows).float()
+
+    def _maybe_observe_dspark_position0_quality(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata,
+        logits: torch.Tensor | None,
+    ) -> None:
+        diagnostics = self._dspark_position0_diagnostics
+        if diagnostics is None or logits is None:
+            return
+
+        first_offsets: list[int] = []
+        active_req_ids: list[str] = []
+        offset = 0
+        for req_id, num_draft in zip(
+            self.input_batch.req_ids,
+            spec_decode_metadata.num_draft_tokens,
+        ):
+            if num_draft > 0:
+                first_offsets.append(offset)
+                active_req_ids.append(req_id)
+            offset += num_draft
+        if not first_offsets:
+            return
+
+        first_offsets_tensor = torch.tensor(
+            first_offsets,
+            dtype=torch.long,
+            device=spec_decode_metadata.draft_token_ids.device,
+        )
+        first_target_indices = spec_decode_metadata.target_logits_indices.index_select(
+            0,
+            first_offsets_tensor,
+        ).long()
+        first_draft_ids = spec_decode_metadata.draft_token_ids.index_select(
+            0,
+            first_offsets_tensor,
+        ).long()
+        target_argmax = logits.index_select(
+            0,
+            first_target_indices,
+        ).argmax(dim=-1)
+        matches = target_argmax.eq(first_draft_ids)
+        confidence = self._get_dspark_position0_confidence(active_req_ids)
+
+        confidences = (
+            None if confidence is None else confidence.detach().cpu().tolist()
+        )
+        diagnostics.observe(
+            matches.detach().cpu().tolist(),
+            confidences,
+        )
+        snapshot = diagnostics.snapshot()
+        if snapshot.num_tokens < self._dspark_position0_log_next:
+            return
+        logger.info(
+            "DSpark position-0 diagnostics: samples=%d, "
+            "target_argmax_match_rate=%.3f, avg_confidence=%s, "
+            "avg_confidence_matched=%s, avg_confidence_missed=%s, "
+            "confidence_logits_normalized=%d",
+            snapshot.num_tokens,
+            snapshot.match_rate,
+            _format_optional_float(snapshot.avg_confidence),
+            _format_optional_float(snapshot.avg_confidence_when_matched),
+            _format_optional_float(snapshot.avg_confidence_when_missed),
+            snapshot.num_confidence_logits_normalized,
+        )
+        self._dspark_position0_log_next = snapshot.num_tokens + 64
 
     def _bookkeeping_sync(
         self,
@@ -3957,6 +4092,52 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+    def _dspark_timing_start(self) -> float:
+        if not self._dspark_iter_timing:
+            return 0.0
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def _dspark_timing_record(self, name: str, started: float) -> None:
+        if not self._dspark_iter_timing or started == 0.0:
+            return
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        self._dspark_iter_timing_totals_ms[name] += (
+            time.perf_counter() - started
+        ) * 1000.0
+
+    def _dspark_timing_finish_iteration(self) -> None:
+        if not self._dspark_iter_timing:
+            return
+        self._dspark_timing_record("iter_total", self._dspark_iter_timing_started)
+        self._dspark_iter_timing_started = 0.0
+        self._dspark_iter_timing_count += 1
+        if self._dspark_iter_timing_count % self._dspark_iter_timing_log_every != 0:
+            return
+
+        names = (
+            "execute_preprocess",
+            "target_forward",
+            "target_postprocess_logits",
+            "sample_reject",
+            "state_update",
+            "draft_propose",
+            "bookkeeping",
+            "finalize_output",
+            "iter_total",
+        )
+        parts = []
+        for name in names:
+            total_ms = self._dspark_iter_timing_totals_ms.get(name, 0.0)
+            parts.append(f"{name}={total_ms / self._dspark_iter_timing_count:.3f}ms")
+        logger.info(
+            "DSpark iteration timing avg over %d iterations: %s",
+            self._dspark_iter_timing_count,
+            ", ".join(parts),
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -3971,6 +4152,8 @@ class GPUModelRunner(
 
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
+
+        self._dspark_iter_timing_started = self._dspark_timing_start()
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -3995,6 +4178,7 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        stage_started = self._dspark_timing_start()
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -4195,6 +4379,7 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+        self._dspark_timing_record("execute_preprocess", stage_started)
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -4216,6 +4401,7 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        stage_started = self._dspark_timing_start()
         with (
             set_forward_context(
                 attn_metadata,
@@ -4241,7 +4427,9 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        self._dspark_timing_record("target_forward", stage_started)
 
+        stage_started = self._dspark_timing_start()
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -4300,6 +4488,7 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+        self._dspark_timing_record("target_postprocess_logits", stage_started)
 
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
@@ -4366,9 +4555,12 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        stage_started = self._dspark_timing_start()
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        self._dspark_timing_record("sample_reject", stage_started)
 
+        stage_started = self._dspark_timing_start()
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
@@ -4381,18 +4573,22 @@ class GPUModelRunner(
                 self._pp_broadcast_prev_sampled_token_ids(
                     sampler_output.sampled_token_ids
                 )
+        self._dspark_timing_record("state_update", stage_started)
 
         self._draft_token_ids = None
         self._draft_token_lengths_cpu = None
         self._draft_token_length_req_ids = None
         self._draft_probs = None
         self._draft_prob_req_ids = None
+        self._draft_confidence = None
+        self._draft_confidence_req_ids = None
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            stage_started = self._dspark_timing_start()
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
@@ -4406,6 +4602,7 @@ class GPUModelRunner(
                     slot_mappings,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
+            self._dspark_timing_record("draft_propose", stage_started)
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
@@ -4485,8 +4682,11 @@ class GPUModelRunner(
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                 self._draft_probs = None
                 self._draft_prob_req_ids = None
+                self._draft_confidence = None
+                self._draft_confidence_req_ids = None
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
+        stage_started = self._dspark_timing_start()
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4503,12 +4703,14 @@ class GPUModelRunner(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+        self._dspark_timing_record("bookkeeping", stage_started)
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
+        stage_started = self._dspark_timing_start()
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
         # draft model to also save its KV cache.
@@ -4552,6 +4754,7 @@ class GPUModelRunner(
                 routed_experts=None,
                 draft_token_lengths=draft_token_lengths,
             )
+        self._dspark_timing_record("finalize_output", stage_started)
 
         if not self.use_async_scheduling:
             if self.routed_experts_initialized:
@@ -4563,6 +4766,7 @@ class GPUModelRunner(
                     routing_data=self.routed_experts_cpu[:total].numpy(),
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
+            self._dspark_timing_finish_iteration()
             return output
 
         with record_function_or_nullcontext(
@@ -4610,6 +4814,7 @@ class GPUModelRunner(
                 async_output.async_copy_ready_event,
             )
 
+        self._dspark_timing_finish_iteration()
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(
@@ -4799,6 +5004,8 @@ class GPUModelRunner(
         assert spec_config is not None
         self._draft_probs = None
         self._draft_prob_req_ids = None
+        self._draft_confidence = None
+        self._draft_confidence_req_ids = None
         if spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -5057,6 +5264,13 @@ class GPUModelRunner(
                 if draft_probs is not None:
                     self._draft_probs = draft_probs
                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
+            if hasattr(self.drafter, "take_last_confidence"):
+                confidence = self.drafter.take_last_confidence()
+                if confidence is not None:
+                    self._draft_confidence = confidence
+                    self._draft_confidence_req_ids = (
+                        self.input_batch.req_ids.copy()
+                    )
             if spec_config.use_dspark() and hasattr(
                 self.drafter, "take_last_draft_lengths"
             ):

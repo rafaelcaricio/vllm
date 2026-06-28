@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -194,6 +195,19 @@ class DSparkDiagnosticsSnapshot:
     scheduled_fraction_per_pos: tuple[float, ...]
 
 
+@dataclass(frozen=True)
+class DSparkPosition0DiagnosticsSnapshot:
+    """Aggregated position-0 draft quality signals."""
+
+    num_tokens: int
+    num_matches: int
+    match_rate: float
+    avg_confidence: float | None
+    avg_confidence_when_matched: float | None
+    avg_confidence_when_missed: float | None
+    num_confidence_logits_normalized: int
+
+
 @dataclass
 class DSparkDiagnostics:
     """Accumulate DSpark confidence-scheduler diagnostics.
@@ -323,6 +337,79 @@ class DSparkDiagnostics:
         )
 
 
+@dataclass
+class DSparkPosition0Diagnostics:
+    """Accumulate first-draft-token agreement and confidence diagnostics."""
+
+    num_tokens: int = 0
+    num_matches: int = 0
+    confidence_sum: float = 0.0
+    confidence_count: int = 0
+    matched_confidence_sum: float = 0.0
+    matched_confidence_count: int = 0
+    missed_confidence_sum: float = 0.0
+    missed_confidence_count: int = 0
+    num_confidence_logits_normalized: int = 0
+
+    def observe(
+        self,
+        matches: Sequence[bool],
+        confidences: Sequence[float] | None = None,
+    ) -> None:
+        if confidences is not None and len(confidences) != len(matches):
+            raise ValueError("confidences and matches must have the same length")
+
+        for index, match in enumerate(matches):
+            self.num_tokens += 1
+            matched = bool(match)
+            if matched:
+                self.num_matches += 1
+
+            if confidences is None:
+                continue
+
+            confidence = float(confidences[index])
+            if not math.isfinite(confidence):
+                continue
+            if confidence < 0.0 or confidence > 1.0:
+                # Diagnostic-only path: preserve the observation without
+                # turning an unexpected raw confidence logit into an engine
+                # failure. Production schedulers still validate strictly.
+                confidence = _sigmoid_scalar(confidence)
+                self.num_confidence_logits_normalized += 1
+            self.confidence_sum += confidence
+            self.confidence_count += 1
+            if matched:
+                self.matched_confidence_sum += confidence
+                self.matched_confidence_count += 1
+            else:
+                self.missed_confidence_sum += confidence
+                self.missed_confidence_count += 1
+
+    @staticmethod
+    def _avg(total: float, count: int) -> float | None:
+        return total / count if count > 0 else None
+
+    def snapshot(self) -> DSparkPosition0DiagnosticsSnapshot:
+        return DSparkPosition0DiagnosticsSnapshot(
+            num_tokens=self.num_tokens,
+            num_matches=self.num_matches,
+            match_rate=(
+                self.num_matches / self.num_tokens if self.num_tokens > 0 else 0.0
+            ),
+            avg_confidence=self._avg(self.confidence_sum, self.confidence_count),
+            avg_confidence_when_matched=self._avg(
+                self.matched_confidence_sum,
+                self.matched_confidence_count,
+            ),
+            avg_confidence_when_missed=self._avg(
+                self.missed_confidence_sum,
+                self.missed_confidence_count,
+            ),
+            num_confidence_logits_normalized=self.num_confidence_logits_normalized,
+        )
+
+
 def _get_config_value(hf_config: Any, name: str, default: Any = ...):
     if isinstance(hf_config, dict):
         if default is ...:
@@ -406,6 +493,14 @@ def _validate_probability(value: float, name: str) -> float:
     if value < 0.0 or value > 1.0:
         raise ValueError(f"{name} must be in [0, 1], got {value}")
     return value
+
+
+def _sigmoid_scalar(value: float) -> float:
+    if value >= 0:
+        z = math.exp(-value)
+        return 1.0 / (1.0 + z)
+    z = math.exp(value)
+    return z / (1.0 + z)
 
 
 def speculative_acceptance_confidence(

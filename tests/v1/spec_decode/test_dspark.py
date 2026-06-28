@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from itertools import product
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ from vllm.config.speculative import SpeculativeConfig
 from vllm.v1.spec_decode.dspark import (
     DSparkDiagnostics,
     DSparkModelSpec,
+    DSparkPosition0Diagnostics,
     confidence_threshold_prefix_length,
     cumulative_survival,
     hardware_aware_prefix_schedule,
@@ -31,6 +33,14 @@ from vllm.v1.spec_decode.dspark_proposer import DSparkProposer
 def _dspark_kernels():
     return pytest.importorskip(
         "vllm.models.deepseek_v4.nvidia.dspark_kernels",
+        reason="DeepSeek V4 CUDA/flash-attention extensions are unavailable",
+        exc_type=ImportError,
+    )
+
+
+def _dspark_model_module():
+    return pytest.importorskip(
+        "vllm.models.deepseek_v4.nvidia.dspark",
         reason="DeepSeek V4 CUDA/flash-attention extensions are unavailable",
         exc_type=ImportError,
     )
@@ -266,6 +276,74 @@ def test_unpack_mhc_pre_outputs_returns_layer_input_first() -> None:
     assert unpacked_comb is comb
 
 
+def test_dspark_vocab_parallel_argmax_masks_padding(monkeypatch) -> None:
+    dspark_model = _dspark_model_module()
+    monkeypatch.setattr(
+        dspark_model,
+        "get_tensor_model_parallel_world_size",
+        lambda: 1,
+    )
+
+    class ShardIndices:
+        org_vocab_start_index = 100
+        num_org_vocab_padding = 2
+
+    class FakeLMHead:
+        shard_indices = ShardIndices()
+
+    local_logits = torch.tensor(
+        [
+            [1.0, 8.0, 7.0, 99.0, 100.0],
+            [5.0, 4.0, 3.0, 2.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    top_tokens = dspark_model._vocab_parallel_argmax(local_logits, FakeLMHead())
+
+    assert top_tokens.tolist() == [101, 100]
+
+
+def test_dspark_markov_argmax_torch_matches_materialized_logits() -> None:
+    kernels = _dspark_kernels()
+    base_logits = torch.tensor(
+        [
+            [1.0, 0.5, 0.0, 100.0],
+            [0.1, 0.2, 0.3, 100.0],
+        ],
+        dtype=torch.float32,
+    )
+    markov_embed = torch.tensor(
+        [
+            [1.0, 2.0],
+            [-1.0, 0.5],
+        ],
+        dtype=torch.float32,
+    )
+    markov_w2_weight = torch.tensor(
+        [
+            [0.0, 0.0],
+            [0.5, 0.0],
+            [0.0, 1.0],
+            [10.0, 10.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    max_vals, local_indices = kernels.dspark_markov_argmax_torch(
+        base_logits,
+        markov_embed,
+        markov_w2_weight,
+        num_pad=1,
+    )
+
+    materialized = base_logits + markov_embed @ markov_w2_weight.t()
+    materialized[:, -1] = -float("inf")
+    expected_vals, expected_indices = materialized.max(dim=-1)
+    assert torch.allclose(max_vals, expected_vals)
+    assert local_indices.tolist() == expected_indices.tolist()
+
+
 def test_make_dspark_warmup_draft_token_ids_returns_valid_tensor() -> None:
     draft_token_ids = make_dspark_warmup_draft_token_ids(
         batch_size=2,
@@ -325,6 +403,129 @@ def _manual_dspark_sparse_attention(
     return torch.stack(rows, dim=0).reshape(
         batch_size * block_size, num_heads, head_dim
     )
+
+
+def _manual_quant_dequant_nope(
+    kv: torch.Tensor,
+    *,
+    rope_dim: int,
+    group_size: int,
+) -> torch.Tensor:
+    head_dim = kv.shape[-1]
+    nope_dim = head_dim - rope_dim
+    out = kv.clone()
+    groups = out[..., :nope_dim].reshape(-1, nope_dim // group_size, group_size)
+    groups_fp32 = groups.float()
+    fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)
+    amax = groups_fp32.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-4)
+    scale = torch.pow(
+        torch.full((), 2.0, device=kv.device, dtype=torch.float32),
+        torch.ceil(torch.log2(amax / fp8_max)),
+    )
+    quantized = torch.clamp(groups_fp32 / scale, -fp8_max, fp8_max).to(
+        torch.float8_e4m3fn
+    )
+    out[..., :nope_dim].copy_(
+        (quantized.float() * scale).reshape_as(out[..., :nope_dim])
+    )
+    return out
+
+
+def test_dspark_quant_dequant_nope_torch_matches_reference_and_preserves_rope() -> None:
+    kernels = _dspark_kernels()
+    rope_dim = 4
+    group_size = 8
+    kv = torch.linspace(-3.0, 2.75, steps=2 * 3 * 20, dtype=torch.float32).view(
+        2, 3, 20
+    )
+    kv = kv.to(torch.bfloat16)
+    original_rope = kv[..., -rope_dim:].clone()
+    expected = _manual_quant_dequant_nope(
+        kv,
+        rope_dim=rope_dim,
+        group_size=group_size,
+    )
+
+    actual = kv.clone()
+    returned = kernels.dspark_quant_dequant_nope_torch(
+        actual,
+        rope_dim=rope_dim,
+        group_size=group_size,
+    )
+
+    assert returned is actual
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual[..., -rope_dim:], original_rope, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_dspark_quant_dequant_nope_triton_matches_reference() -> None:
+    kernels = _dspark_kernels()
+    device = torch.device("cuda")
+    rope_dim = 8
+    group_size = 8
+    generator = torch.Generator(device=device).manual_seed(529)
+    kv = torch.randn(
+        4,
+        5,
+        40,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    expected = _manual_quant_dequant_nope(
+        kv,
+        rope_dim=rope_dim,
+        group_size=group_size,
+    )
+
+    actual = kv.clone()
+    returned = kernels.dspark_quant_dequant_nope(
+        actual,
+        rope_dim=rope_dim,
+        group_size=group_size,
+    )
+    torch.cuda.synchronize()
+
+    assert returned is actual
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_dspark_quant_dequant_nope_triton_is_cuda_graph_safe() -> None:
+    kernels = _dspark_kernels()
+    device = torch.device("cuda")
+    rope_dim = 8
+    group_size = 8
+    kv_base = torch.randn(2, 5, 40, device=device, dtype=torch.bfloat16)
+
+    for _ in range(3):
+        kernels.dspark_quant_dequant_nope(
+            kv_base.clone(),
+            rope_dim=rope_dim,
+            group_size=group_size,
+        )
+    torch.cuda.synchronize()
+
+    eager_input = kv_base.clone()
+    expected = kernels.dspark_quant_dequant_nope(
+        eager_input,
+        rope_dim=rope_dim,
+        group_size=group_size,
+    ).clone()
+    captured_input = kv_base.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = kernels.dspark_quant_dequant_nope(
+            captured_input,
+            rope_dim=rope_dim,
+            group_size=group_size,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert captured is captured_input
+    torch.testing.assert_close(captured_input, expected, rtol=0, atol=0)
 
 
 def test_dspark_sparse_attention_reference_matches_manual_window_semantics() -> None:
@@ -543,7 +744,10 @@ def test_dspark_proposer_wraps_draft_in_forward_context(
             self,
             _hidden_by_req: torch.Tensor,
             _positions_by_req: torch.Tensor,
+            *,
+            num_rejected_tokens: torch.Tensor | None = None,
         ) -> None:
+            del num_rejected_tokens
             assert not in_forward_context
 
         def draft(
@@ -654,7 +858,10 @@ def test_dspark_proposer_skips_confidence_observation_when_threshold_off(
             self,
             _hidden_by_req: torch.Tensor,
             _positions_by_req: torch.Tensor,
+            *,
+            num_rejected_tokens: torch.Tensor | None = None,
         ) -> None:
+            del num_rejected_tokens
             return None
 
     monkeypatch.setattr(
@@ -672,13 +879,15 @@ def test_dspark_proposer_skips_confidence_observation_when_threshold_off(
         "_prepare_draft_buffers",
         lambda _self, **_kwargs: None,
     )
+    model_confidence = torch.full((1, 5), 0.95, dtype=torch.float32)
+
     monkeypatch.setattr(
         DSparkProposer,
         "_run_draft_for_current_context",
         lambda _self: (
             torch.full((1, 5), 7, dtype=torch.long),
             torch.zeros(1, 5, 13, dtype=torch.float32),
-            torch.full((1, 5), 0.95, dtype=torch.float32),
+            model_confidence,
         ),
     )
 
@@ -693,8 +902,10 @@ def test_dspark_proposer_skips_confidence_observation_when_threshold_off(
     proposer.num_speculative_tokens = 5
     proposer.confidence_threshold = 0.0
     proposer._collect_confidence_diagnostics = False
+    proposer._collect_position0_diagnostics = True
     proposer._export_draft_probs = False
     proposer._last_draft_probs = None
+    proposer._last_confidence = None
     proposer._prefilled = True
     proposer.model = FakeDSparkModel()
 
@@ -711,31 +922,37 @@ def test_dspark_proposer_skips_confidence_observation_when_threshold_off(
 
     assert draft_ids.tolist() == [[7, 7, 7, 7, 7]]
     assert DSparkProposer.take_last_draft_lengths(proposer) == [5]
+    assert proposer._last_confidence is not None
+    torch.testing.assert_close(proposer._last_confidence, model_confidence)
+    assert proposer._last_confidence.data_ptr() != model_confidence.data_ptr()
 
 
 @pytest.mark.parametrize(
     (
         "confidence_threshold",
         "collect_confidence_diagnostics",
+        "collect_position0_diagnostics",
         "export_draft_probs",
         "expected_return_logits",
         "expected_return_confidence",
     ),
     [
-        (0.0, False, False, False, False),
-        (0.5, False, False, False, True),
-        (0.0, True, False, False, True),
-        (0.0, False, True, True, False),
+        (0.0, False, False, False, False, False),
+        (0.5, False, False, False, False, True),
+        (0.0, True, False, False, False, True),
+        (0.0, False, True, False, False, True),
+        (0.0, False, False, True, True, False),
     ],
 )
 def test_dspark_proposer_requests_only_needed_draft_outputs(
     confidence_threshold: float,
     collect_confidence_diagnostics: bool,
+    collect_position0_diagnostics: bool,
     export_draft_probs: bool,
     expected_return_logits: bool,
     expected_return_confidence: bool,
 ) -> None:
-    observed_flags: list[tuple[bool, bool]] = []
+    observed_flags: list[tuple[bool, bool, bool]] = []
 
     class FakeModel:
         def draft_with_confidence(
@@ -746,8 +963,11 @@ def test_dspark_proposer_requests_only_needed_draft_outputs(
             *,
             return_logits: bool,
             return_confidence: bool,
+            store_main_kv: bool,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            observed_flags.append((return_logits, return_confidence))
+            observed_flags.append(
+                (return_logits, return_confidence, store_main_kv)
+            )
             batch_size = input_ids.shape[0]
             logits = (
                 torch.zeros(batch_size, 5, 13)
@@ -770,13 +990,14 @@ def test_dspark_proposer_requests_only_needed_draft_outputs(
     proposer.confidence_threshold = confidence_threshold
     proposer._collect_confidence_diagnostics = collect_confidence_diagnostics
     proposer._export_draft_probs = export_draft_probs
+    proposer._collect_position0_diagnostics = collect_position0_diagnostics
 
     draft_ids, logits, confidence = DSparkProposer._run_draft_from_buffers(
         proposer
     )
 
     assert observed_flags == [
-        (expected_return_logits, expected_return_confidence)
+        (expected_return_logits, expected_return_confidence, False)
     ]
     assert draft_ids.tolist() == [[7, 7, 7, 7, 7], [7, 7, 7, 7, 7]]
     assert logits.numel() > 0 if expected_return_logits else logits.numel() == 0
@@ -785,6 +1006,287 @@ def test_dspark_proposer_requests_only_needed_draft_outputs(
         if expected_return_confidence
         else confidence.numel() == 0
     )
+
+
+def test_dspark_proposer_exposes_position0_confidence() -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.num_speculative_tokens = 5
+    proposer._collect_position0_diagnostics = True
+    proposer._last_confidence = None
+    confidence = torch.tensor(
+        [[0.9, 0.8, 0.7, 0.6, 0.5], [0.4, 0.3, 0.2, 0.1, 0.0]],
+        dtype=torch.float32,
+    )
+
+    proposer._last_confidence = confidence.detach()
+
+    observed = DSparkProposer.take_last_confidence(proposer)
+    assert observed is not None
+    torch.testing.assert_close(observed, confidence)
+    assert DSparkProposer.take_last_confidence(proposer) is None
+
+
+def test_dspark_draft_fast_path_can_return_confidence_without_logits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dspark_module = _dspark_model_module()
+
+    monkeypatch.setattr(
+        dspark_module,
+        "_vocab_parallel_argmax",
+        lambda local_logits, _lm_head: local_logits.argmax(dim=-1).to(torch.long),
+    )
+
+    class FakeEmbedTokens:
+
+        def __call__(self, input_ids: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(*input_ids.shape, 3)
+
+    class FakeQuantMethod:
+
+        def apply(
+            self,
+            lm_head: object,
+            normed: torch.Tensor,
+            bias: object = None,
+        ) -> torch.Tensor:
+            del bias
+            return lm_head.local_logits[: normed.shape[0]]
+
+    class FakeLMHead:
+        quant_method = FakeQuantMethod()
+
+        def __init__(self) -> None:
+            self.local_logits = torch.tensor(
+                [
+                    [0.0, 8.0, 0.0, 0.0],
+                    [0.0, 0.0, 8.0, 0.0],
+                ],
+                dtype=torch.float32,
+            )
+
+    class FakeMarkovHead:
+
+        def forward_local(
+            self,
+            token_ids: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            markov_embed = token_ids.float().unsqueeze(-1).repeat(1, 2)
+            return torch.zeros(token_ids.shape[0], 4), markov_embed
+
+    class FakeConfidenceHead:
+
+        def __init__(self) -> None:
+            self.markov_embed: torch.Tensor | None = None
+
+        def __call__(
+            self,
+            dense: torch.Tensor,
+            markov_embed: torch.Tensor,
+        ) -> torch.Tensor:
+            del dense
+            self.markov_embed = markov_embed.detach().clone()
+            return torch.zeros(markov_embed.shape[:2], dtype=torch.float32)
+
+    class FakeFinalLayer:
+
+        def __init__(self) -> None:
+            self.markov_head = FakeMarkovHead()
+            self.confidence_head = FakeConfidenceHead()
+            self.norm = lambda x: x
+            self.store_main_kv_flags: list[bool] = []
+            self.draft_positions: torch.Tensor | None = None
+            self.draft_input_ids: torch.Tensor | None = None
+            self.main_x_shape: torch.Size | None = None
+
+        def forward_dspark(
+            self,
+            x: torch.Tensor,
+            positions: torch.Tensor,
+            input_ids: torch.Tensor,
+            **kwargs: object,
+        ) -> torch.Tensor:
+            self.draft_positions = positions.detach().clone()
+            self.draft_input_ids = input_ids.detach().clone()
+            self.main_x_shape = kwargs["main_x"].shape
+            self.store_main_kv_flags.append(
+                bool(kwargs.get("store_main_kv", True))
+            )
+            return x
+
+        def forward_head(self, x: torch.Tensor) -> torch.Tensor:
+            return x.squeeze(1)
+
+    final_layer = FakeFinalLayer()
+    model = dspark_module.DeepSeekV4DSparkModel.__new__(
+        dspark_module.DeepSeekV4DSparkModel
+    )
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(hidden_size=3, hc_mult=1, vocab_size=4)
+    model.block_size = 2
+    model.noise_token_id = 0
+    model._local_argmax = True
+    model.stage_layer_keys = ["0"]
+    model.layers = {"0": final_layer}
+    model.embed_tokens = FakeEmbedTokens()
+    project_main_calls: list[torch.Tensor] = []
+
+    def fake_project_main(main_hidden: torch.Tensor) -> torch.Tensor:
+        project_main_calls.append(main_hidden.detach().clone())
+        return torch.zeros(main_hidden.shape[0], 3)
+
+    model.project_main = fake_project_main
+
+    draft_ids, logits, confidence = dspark_module.DeepSeekV4DSparkModel.draft(
+        model,
+        torch.tensor([3], dtype=torch.long),
+        torch.zeros(1, 3),
+        torch.tensor([9], dtype=torch.long),
+        FakeLMHead(),
+        logits_processor=None,
+        return_logits=False,
+        return_confidence=True,
+        store_main_kv=False,
+    )
+
+    assert draft_ids.tolist() == [[1, 2]]
+    assert logits.numel() == 0
+    assert confidence.tolist() == [[0.5, 0.5]]
+    assert final_layer.draft_input_ids is not None
+    assert final_layer.draft_input_ids.tolist() == [3, 0]
+    assert final_layer.draft_positions is not None
+    assert final_layer.draft_positions.tolist() == [9, 10]
+    assert final_layer.main_x_shape == torch.Size([1, 1, 3])
+    assert len(project_main_calls) == 1
+    assert project_main_calls[0].shape == torch.Size([1, 3])
+    assert final_layer.store_main_kv_flags == [False]
+    assert final_layer.confidence_head.markov_embed is not None
+    assert final_layer.confidence_head.markov_embed[:, :, 0].tolist() == [
+        [3.0, 1.0]
+    ]
+
+
+def test_dspark_draft_fast_path_can_use_fused_markov_argmax(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dspark_module = _dspark_model_module()
+    fused_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def fake_fused_markov_argmax(
+        base_logits: torch.Tensor,
+        markov_embed: torch.Tensor,
+        markov_w2: object,
+        lm_head: object,
+    ) -> torch.Tensor:
+        del markov_w2, lm_head
+        fused_calls.append(
+            (base_logits.detach().clone(), markov_embed.detach().clone())
+        )
+        return torch.full(
+            (base_logits.shape[0],),
+            len(fused_calls),
+            dtype=torch.long,
+            device=base_logits.device,
+        )
+
+    monkeypatch.setattr(
+        dspark_module,
+        "_vocab_parallel_markov_argmax",
+        fake_fused_markov_argmax,
+    )
+
+    class FakeEmbedTokens:
+
+        def __call__(self, input_ids: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(*input_ids.shape, 3)
+
+    class FakeQuantMethod:
+
+        def apply(
+            self,
+            lm_head: object,
+            normed: torch.Tensor,
+            bias: object = None,
+        ) -> torch.Tensor:
+            del bias
+            return lm_head.local_logits[: normed.shape[0]]
+
+    class FakeLMHead:
+        quant_method = FakeQuantMethod()
+
+        def __init__(self) -> None:
+            self.local_logits = torch.tensor(
+                [
+                    [0.0, 8.0, 0.0, 0.0],
+                    [0.0, 0.0, 8.0, 0.0],
+                ],
+                dtype=torch.float32,
+            )
+
+    class FakeMarkovHead:
+        markov_w2 = object()
+
+        def markov_w1(self, token_ids: torch.Tensor) -> torch.Tensor:
+            return token_ids.float().unsqueeze(-1).repeat(1, 2)
+
+        def forward_local(
+            self,
+            token_ids: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            del token_ids
+            raise AssertionError("fused fast path should not materialize logits")
+
+    class FakeFinalLayer:
+
+        def __init__(self) -> None:
+            self.markov_head = FakeMarkovHead()
+            self.norm = lambda x: x
+
+        def forward_dspark(
+            self,
+            x: torch.Tensor,
+            positions: torch.Tensor,
+            input_ids: torch.Tensor,
+            **kwargs: object,
+        ) -> torch.Tensor:
+            del positions, input_ids, kwargs
+            return x
+
+        def forward_head(self, x: torch.Tensor) -> torch.Tensor:
+            return x.squeeze(1)
+
+    model = dspark_module.DeepSeekV4DSparkModel.__new__(
+        dspark_module.DeepSeekV4DSparkModel
+    )
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(hidden_size=3, hc_mult=1, vocab_size=4)
+    model.block_size = 2
+    model.noise_token_id = 0
+    model._local_argmax = True
+    model._fused_markov_argmax = True
+    model.stage_layer_keys = ["0"]
+    model.layers = {"0": FakeFinalLayer()}
+    model.embed_tokens = FakeEmbedTokens()
+    model.project_main = lambda main_hidden: torch.zeros(main_hidden.shape[0], 3)
+
+    draft_ids, logits, confidence = dspark_module.DeepSeekV4DSparkModel.draft(
+        model,
+        torch.tensor([3], dtype=torch.long),
+        torch.zeros(1, 3),
+        torch.tensor([9], dtype=torch.long),
+        FakeLMHead(),
+        logits_processor=None,
+        return_logits=False,
+        return_confidence=False,
+        store_main_kv=False,
+    )
+
+    assert draft_ids.tolist() == [[1, 2]]
+    assert logits.numel() == 0
+    assert confidence.numel() == 0
+    assert len(fused_calls) == 2
+    assert fused_calls[0][1].tolist() == [[3.0, 3.0]]
+    assert fused_calls[1][1].tolist() == [[1.0, 1.0]]
 
 
 def test_dspark_proposer_trims_rejected_target_context() -> None:
@@ -832,10 +1334,185 @@ def test_dspark_proposer_rejects_non_uniform_trimmed_context() -> None:
         )
 
 
+def test_dspark_proposer_can_mask_rejected_context_on_gpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_rejected: list[torch.Tensor | None] = []
+
+    class FakeDSparkModel:
+        def prefill_main(
+            self,
+            _hidden_by_req: torch.Tensor,
+            _positions_by_req: torch.Tensor,
+            *,
+            num_rejected_tokens: torch.Tensor | None = None,
+        ) -> None:
+            captured_rejected.append(num_rejected_tokens)
+
+    def fail_cpu_trim(*_args, **_kwargs):
+        raise AssertionError("GPU rejected-context mask should skip CPU trim")
+
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_trim_rejected_target_context",
+        fail_cpu_trim,
+    )
+
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.device = torch.device("cpu")
+    proposer.num_speculative_tokens = 5
+    proposer.noise_token_id = 128799
+    proposer._last_draft_probs = None
+    proposer._last_confidence = None
+    proposer._last_draft_lengths = None
+    proposer._gpu_rejected_context_mask = True
+    proposer._prefilled = False
+    proposer.model = FakeDSparkModel()
+    rejected = torch.tensor([2], dtype=torch.int32)
+
+    draft_ids = DSparkProposer.propose(
+        proposer,
+        target_token_ids=torch.empty(1, dtype=torch.long),
+        target_positions=torch.arange(4, dtype=torch.long),
+        target_hidden_states=torch.zeros(4, 3),
+        next_token_ids=torch.tensor([11], dtype=torch.int32),
+        token_indices_to_sample=None,
+        common_attn_metadata=None,  # type: ignore[arg-type]
+        sampling_metadata=None,  # type: ignore[arg-type]
+        num_rejected_tokens_gpu=rejected,
+    )
+
+    assert captured_rejected == [rejected]
+    assert draft_ids.tolist() == [[128799] * 5]
+
+
+def test_dspark_proposer_gpu_mask_anchors_on_last_non_rejected_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.spec_decode.dspark_proposer as dspark_proposer_module
+
+    class FakeForwardContext:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    captured_prefill: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = []
+    captured_draft: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    class FakeDSparkModel:
+        def prefill_main(
+            self,
+            hidden_by_req: torch.Tensor,
+            positions_by_req: torch.Tensor,
+            *,
+            num_rejected_tokens: torch.Tensor | None = None,
+        ) -> None:
+            captured_prefill.append(
+                (
+                    hidden_by_req.detach().clone(),
+                    positions_by_req.detach().clone(),
+                    num_rejected_tokens,
+                )
+            )
+
+    def fail_cpu_trim(*_args, **_kwargs):
+        raise AssertionError("GPU rejected-context mask should skip CPU trim")
+
+    def capture_draft_buffers(
+        _self: DSparkProposer,
+        *,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        padded_batch_size: int,
+    ) -> None:
+        del input_ids, padded_batch_size
+        captured_draft.append(
+            (hidden_states.detach().clone(), positions.detach().clone())
+        )
+
+    monkeypatch.setattr(
+        dspark_proposer_module,
+        "set_forward_context",
+        lambda *_args, **_kwargs: FakeForwardContext(),
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_trim_rejected_target_context",
+        fail_cpu_trim,
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_determine_graph_batch",
+        lambda _self, batch_size: (None, batch_size, None, None),
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_prepare_draft_buffers",
+        capture_draft_buffers,
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_run_draft_for_current_context",
+        lambda _self: (
+            torch.full((1, 5), 7, dtype=torch.long),
+            torch.empty(0, 0, 0),
+            torch.empty(1, 0),
+        ),
+    )
+
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.vllm_config = object()
+    proposer.device = torch.device("cpu")
+    proposer.num_speculative_tokens = 5
+    proposer.confidence_threshold = 0.0
+    proposer._collect_confidence_diagnostics = False
+    proposer._collect_position0_diagnostics = False
+    proposer._export_draft_probs = False
+    proposer._last_draft_probs = None
+    proposer._last_confidence = None
+    proposer._last_draft_lengths = None
+    proposer._gpu_rejected_context_mask = True
+    proposer._prefilled = True
+    proposer.model = FakeDSparkModel()
+
+    hidden = torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
+    positions = torch.tensor([10, 11, 12, 13], dtype=torch.long)
+    rejected = torch.tensor([2], dtype=torch.int32)
+
+    draft_ids = DSparkProposer.propose(
+        proposer,
+        target_token_ids=torch.empty(1, dtype=torch.long),
+        target_positions=positions,
+        target_hidden_states=hidden,
+        next_token_ids=torch.tensor([21], dtype=torch.int32),
+        token_indices_to_sample=None,
+        common_attn_metadata=None,  # type: ignore[arg-type]
+        sampling_metadata=None,  # type: ignore[arg-type]
+        num_rejected_tokens_gpu=rejected,
+    )
+
+    assert len(captured_prefill) == 1
+    prefill_hidden, prefill_positions, prefill_rejected = captured_prefill[0]
+    torch.testing.assert_close(prefill_hidden, hidden.view(1, 4, 3))
+    torch.testing.assert_close(prefill_positions, positions.view(1, 4))
+    assert prefill_rejected is rejected
+
+    assert len(captured_draft) == 1
+    draft_hidden, draft_positions = captured_draft[0]
+    torch.testing.assert_close(draft_hidden, hidden[1:2])
+    torch.testing.assert_close(draft_positions, torch.tensor([11]))
+    assert draft_ids.tolist() == [[7, 7, 7, 7, 7]]
+    assert DSparkProposer.take_last_draft_lengths(proposer) == [5]
+
+
 def test_dspark_proposer_confidence_threshold_sets_prefix_lengths() -> None:
     proposer = DSparkProposer.__new__(DSparkProposer)
     proposer.num_speculative_tokens = 5
     proposer.confidence_threshold = 0.73
+    proposer._forced_draft_length = None
     proposer.diagnostics = DSparkDiagnostics(max_spec_tokens=5)
 
     lengths = DSparkProposer._observe_confidence(
@@ -860,6 +1537,7 @@ def test_dspark_proposer_threshold_zero_keeps_full_block() -> None:
     proposer = DSparkProposer.__new__(DSparkProposer)
     proposer.num_speculative_tokens = 5
     proposer.confidence_threshold = 0.0
+    proposer._forced_draft_length = None
 
     lengths = DSparkProposer._draft_lengths_from_confidence(
         proposer,
@@ -867,6 +1545,58 @@ def test_dspark_proposer_threshold_zero_keeps_full_block() -> None:
     )
 
     assert lengths == [2, 5]
+
+
+def test_dspark_proposer_forced_draft_length_overrides_scheduler() -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.num_speculative_tokens = 5
+    proposer.confidence_threshold = 0.99
+    proposer.confidence_scheduler = "hardware"
+    proposer._forced_draft_length = 2
+    proposer._sps_curve = ()
+
+    lengths = DSparkProposer._draft_lengths_from_confidence(
+        proposer,
+        [[0.10], [0.10, 0.10, 0.10, 0.10, 0.10]],
+    )
+
+    assert lengths == [1, 2]
+
+
+def test_dspark_proposer_validates_forced_draft_length(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_DSPARK_FORCE_DRAFT_LENGTH", "3")
+    assert DSparkProposer._read_forced_draft_length(5) == 3
+
+    monkeypatch.setenv("VLLM_DSPARK_FORCE_DRAFT_LENGTH", "")
+    assert DSparkProposer._read_forced_draft_length(5) is None
+
+    monkeypatch.setenv("VLLM_DSPARK_FORCE_DRAFT_LENGTH", "6")
+    with pytest.raises(ValueError, match=r"\[0, 5\]"):
+        DSparkProposer._read_forced_draft_length(5)
+
+
+def test_dspark_proposer_hardware_scheduler_uses_profiled_sps_curve() -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.num_speculative_tokens = 3
+    proposer.confidence_threshold = 0.0
+    proposer.confidence_scheduler = "hardware"
+    proposer._forced_draft_length = None
+    proposer._sps_curve = (
+        (1, 100.0),
+        (2, 100.0),
+        (3, 40.0),
+        (4, 30.0),
+    )
+    proposer._hardware_scheduler_early_stop = True
+
+    schedule = DSparkProposer._schedule_from_confidence(
+        proposer,
+        [[0.95, 0.90, 0.90]],
+    )
+
+    assert schedule.lengths == (1,)
+    assert schedule.batch_tokens == 2
+    assert schedule.expected_tokens_per_second == pytest.approx(195.0)
 
 
 def test_gpu_model_runner_trims_dspark_draft_rows_by_confidence_lengths() -> None:
@@ -984,6 +1714,100 @@ def test_dspark_diagnostics_rejects_invalid_schedule_lengths() -> None:
 
     with pytest.raises(ValueError, match="scheduled length"):
         diagnostics.observe([[0.8]], bad_result)
+
+
+def test_dspark_position0_diagnostics_accumulates_confidence_by_outcome() -> None:
+    diagnostics = DSparkPosition0Diagnostics()
+
+    diagnostics.observe([True, False, True], [0.9, 0.2, 0.7])
+    snapshot = diagnostics.snapshot()
+
+    assert snapshot.num_tokens == 3
+    assert snapshot.num_matches == 2
+    assert snapshot.match_rate == pytest.approx(2 / 3)
+    assert snapshot.avg_confidence == pytest.approx(0.6)
+    assert snapshot.avg_confidence_when_matched == pytest.approx(0.8)
+    assert snapshot.avg_confidence_when_missed == pytest.approx(0.2)
+    assert snapshot.num_confidence_logits_normalized == 0
+
+
+def test_dspark_position0_diagnostics_normalizes_raw_confidence_logits() -> None:
+    diagnostics = DSparkPosition0Diagnostics()
+
+    diagnostics.observe([False], [-0.048030007630586624])
+    snapshot = diagnostics.snapshot()
+
+    assert snapshot.num_tokens == 1
+    assert snapshot.num_matches == 0
+    assert snapshot.avg_confidence == pytest.approx(
+        torch.sigmoid(torch.tensor(-0.048030007630586624)).item()
+    )
+    assert snapshot.avg_confidence_when_matched is None
+    assert snapshot.avg_confidence_when_missed == pytest.approx(
+        snapshot.avg_confidence
+    )
+    assert snapshot.num_confidence_logits_normalized == 1
+
+
+def test_dspark_position0_diagnostics_allows_missing_confidence() -> None:
+    diagnostics = DSparkPosition0Diagnostics()
+
+    diagnostics.observe([True, False])
+    snapshot = diagnostics.snapshot()
+
+    assert snapshot.num_tokens == 2
+    assert snapshot.num_matches == 1
+    assert snapshot.match_rate == pytest.approx(0.5)
+    assert snapshot.avg_confidence is None
+    assert snapshot.avg_confidence_when_matched is None
+    assert snapshot.avg_confidence_when_missed is None
+    assert snapshot.num_confidence_logits_normalized == 0
+
+
+def test_gpu_model_runner_observes_dspark_position0_quality() -> None:
+    from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.input_batch = SimpleNamespace(req_ids=["req-a", "req-b"])
+    runner._draft_confidence = torch.tensor(
+        [
+            [0.9, 0.8, 0.7],
+            [0.2, 0.1, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    runner._draft_confidence_req_ids = ["req-a", "req-b"]
+    runner._dspark_position0_diagnostics = DSparkPosition0Diagnostics()
+    runner._dspark_position0_log_next = 10_000
+
+    metadata = SpecDecodeMetadata(
+        draft_token_ids=torch.tensor([3, 4, 5], dtype=torch.int32),
+        num_draft_tokens=[2, 1],
+        cu_num_draft_tokens=torch.tensor([2, 3], dtype=torch.int32),
+        cu_num_sampled_tokens=torch.tensor([3, 5], dtype=torch.int32),
+        target_logits_indices=torch.tensor([0, 1, 3], dtype=torch.int32),
+        bonus_logits_indices=torch.tensor([2, 4], dtype=torch.int32),
+        logits_indices=torch.arange(5, dtype=torch.int32),
+    )
+    logits = torch.zeros(5, 8, dtype=torch.float32)
+    logits[0, 3] = 10.0
+    logits[3, 6] = 10.0
+
+    GPUModelRunner._maybe_observe_dspark_position0_quality(
+        runner,
+        metadata,
+        logits,
+    )
+
+    snapshot = runner._dspark_position0_diagnostics.snapshot()
+    assert snapshot.num_tokens == 2
+    assert snapshot.num_matches == 1
+    assert snapshot.match_rate == pytest.approx(0.5)
+    assert snapshot.avg_confidence == pytest.approx(0.55)
+    assert snapshot.avg_confidence_when_matched == pytest.approx(0.9)
+    assert snapshot.avg_confidence_when_missed == pytest.approx(0.2)
+    assert snapshot.num_confidence_logits_normalized == 0
 
 
 def test_cumulative_survival_multiplies_conditional_confidences() -> None:

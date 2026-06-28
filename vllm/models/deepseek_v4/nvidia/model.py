@@ -3,6 +3,7 @@
 import os
 import time
 import typing
+from collections import defaultdict
 from collections.abc import Callable, Iterable
 from itertools import islice
 
@@ -84,6 +85,95 @@ _B12X_MHC_TRACE_LIMIT = int(
     )
 )
 _B12X_MHC_TRACE_COUNTS: dict[str, int] = {}
+
+
+def _env_enabled(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+    )
+
+
+_DSPARK_DEFER_TARGET_CAPTURE = _env_enabled(
+    "VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE"
+)
+_DSPARK_DEFER_TARGET_CAPTURE_EXACT = _env_enabled(
+    "VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE_EXACT"
+)
+_DSPARK_TARGET_TIMING = _env_enabled("VLLM_DSPARK_TARGET_TIMING")
+_DSPARK_TARGET_TIMING_LOG_EVERY = int(
+    os.environ.get("VLLM_DSPARK_TARGET_TIMING_LOG_EVERY", "20")
+)
+_DSPARK_TARGET_TIMING_TOTALS: defaultdict[str, float] = defaultdict(float)
+_DSPARK_TARGET_TIMING_COUNTS: defaultdict[str, int] = defaultdict(int)
+_DSPARK_TARGET_TIMING_FORWARDS = 0
+
+
+def _dspark_target_timing_active() -> bool:
+    if not _DSPARK_TARGET_TIMING:
+        return False
+    compiler = getattr(torch, "compiler", None)
+    is_compiling = getattr(compiler, "is_compiling", None)
+    if is_compiling is not None and is_compiling():
+        return False
+    return True
+
+
+def _dspark_target_timing_start() -> float:
+    if not _dspark_target_timing_active():
+        return 0.0
+    if current_platform.is_cuda():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _dspark_target_timing_record(stage: str, started: float) -> None:
+    if not _dspark_target_timing_active() or started == 0.0:
+        return
+    if current_platform.is_cuda():
+        torch.cuda.synchronize()
+    _DSPARK_TARGET_TIMING_TOTALS[stage] += (time.perf_counter() - started) * 1000.0
+    _DSPARK_TARGET_TIMING_COUNTS[stage] += 1
+
+
+def _dspark_target_timing_finish(total_started: float, tokens: int, layers: int) -> None:
+    global _DSPARK_TARGET_TIMING_FORWARDS
+
+    if not _dspark_target_timing_active():
+        return
+    _dspark_target_timing_record("forward_total", total_started)
+    _DSPARK_TARGET_TIMING_FORWARDS += 1
+    every = max(1, _DSPARK_TARGET_TIMING_LOG_EVERY)
+    if _DSPARK_TARGET_TIMING_FORWARDS % every != 0:
+        return
+
+    forwards = max(1, _DSPARK_TARGET_TIMING_FORWARDS)
+    stages = (
+        "embed_or_input",
+        "layers_total",
+        "layer_attn_mhc",
+        "layer_attn",
+        "layer_ffn_mhc",
+        "layer_ffn",
+        "dspark_capture",
+        "final_hc_post",
+        "mtp_hidden_copy",
+        "hc_head_norm",
+        "forward_total",
+    )
+    avg = {
+        stage: _DSPARK_TARGET_TIMING_TOTALS.get(stage, 0.0) / forwards
+        for stage in stages
+    }
+    logger.info(
+        "DSpark target timing forwards=%d last_tokens=%d layers=%d avg_ms=%s",
+        _DSPARK_TARGET_TIMING_FORWARDS,
+        tokens,
+        layers,
+        ", ".join(f"{stage}:{avg[stage]:.3f}" for stage in stages),
+    )
 
 
 def _trace_b12x_mhc_call(
@@ -1038,6 +1128,10 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         config = vllm_config.model_config.hf_config
         self.layer_name = prefix
+        self._dspark_prev_capture_buffer: torch.Tensor | None = None
+        self._dspark_prev_capture_start = 0
+        self._dspark_prev_capture_end = 0
+        self._dspark_prev_capture_exact = False
         self._use_b12x_mhc = _use_b12x_mhc()
         self._b12x_mhc_max_tokens = _b12x_mhc_max_tokens() if self._use_b12x_mhc else 0
         if self._use_b12x_mhc:
@@ -1162,6 +1256,56 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.mhc_pre = MHCPreOp()
         self.mhc_post = MHCPostOp()
         self.mhc_fused_post_pre = MHCFusedPostPreOp()
+
+    def set_dspark_previous_layer_capture(
+        self,
+        buffer: torch.Tensor,
+        start: int,
+        end: int,
+        *,
+        exact: bool = False,
+    ) -> None:
+        self._dspark_prev_capture_buffer = buffer
+        self._dspark_prev_capture_start = int(start)
+        self._dspark_prev_capture_end = int(end)
+        self._dspark_prev_capture_exact = bool(exact)
+
+    def _maybe_capture_dspark_previous_layer_exact(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> None:
+        buffer = self._dspark_prev_capture_buffer
+        if buffer is None or not self._dspark_prev_capture_exact:
+            return
+        start = self._dspark_prev_capture_start
+        end = self._dspark_prev_capture_end
+        from vllm.models.deepseek_v4.nvidia.dspark_kernels import (
+            dspark_hc_post_mean,
+        )
+
+        dspark_hc_post_mean(
+            x,
+            residual,
+            post,
+            comb,
+            buffer[: x.shape[0], start:end],
+        )
+
+    def _maybe_capture_dspark_previous_layer(
+        self,
+        residual: torch.Tensor,
+    ) -> None:
+        buffer = self._dspark_prev_capture_buffer
+        if buffer is None:
+            return
+        if self._dspark_prev_capture_exact:
+            return
+        start = self._dspark_prev_capture_start
+        end = self._dspark_prev_capture_end
+        buffer[: residual.shape[0], start:end].copy_(residual.mean(dim=1))
 
     def _should_run_b12x_mhc(self, tokens: int) -> bool:
         if not self._use_b12x_mhc:
@@ -1353,6 +1497,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self._should_run_b12x_mhc(int(x.shape[0])):
             attn_norm_weight = self.attn_norm.weight.data
             attn_norm_eps = self.attn_norm.variance_epsilon
+            stage_start = _dspark_target_timing_start()
             if residual is None:
                 residual = x
                 x, post_mix, res_mix = self.hc_pre(
@@ -1366,6 +1511,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 assert post_mix is not None
                 assert res_mix is not None
+                self._maybe_capture_dspark_previous_layer_exact(
+                    x, residual, post_mix, res_mix
+                )
                 residual, post_mix, res_mix, x = self.hc_post_pre(
                     x,
                     residual,
@@ -1377,11 +1525,16 @@ class DeepseekV4DecoderLayer(nn.Module):
                     norm_weight=attn_norm_weight,
                     norm_eps=attn_norm_eps,
                 )
+                self._maybe_capture_dspark_previous_layer(residual)
+            _dspark_target_timing_record("layer_attn_mhc", stage_start)
 
+            stage_start = _dspark_target_timing_start()
             x = self.attn(positions, x, None)
+            _dspark_target_timing_record("layer_attn", stage_start)
 
             ffn_norm_weight = self.ffn_norm.weight.data
             ffn_norm_eps = self.ffn_norm.variance_epsilon
+            stage_start = _dspark_target_timing_start()
             residual, post_mix, res_mix, x = self.hc_post_pre(
                 x,
                 residual,
@@ -1393,12 +1546,16 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_weight=ffn_norm_weight,
                 norm_eps=ffn_norm_eps,
             )
+            _dspark_target_timing_record("layer_ffn_mhc", stage_start)
+            stage_start = _dspark_target_timing_start()
             x = self.ffn(x, input_ids)
+            _dspark_target_timing_record("layer_ffn", stage_start)
             return x, residual, post_mix, res_mix
 
         assert self.mhc_fused_post_pre is not None
         attn_norm_weight = self.attn_norm.weight.data
         attn_norm_eps = self.attn_norm.variance_epsilon
+        stage_start = _dspark_target_timing_start()
         if residual is None:
             # Run standalone hc_pre on first layer
             residual = x
@@ -1411,6 +1568,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=attn_norm_eps,
             )
         else:
+            assert post_mix is not None
+            assert res_mix is not None
+            self._maybe_capture_dspark_previous_layer_exact(
+                x, residual, post_mix, res_mix
+            )
             residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
                 x,
                 residual,
@@ -1429,12 +1591,17 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_weight=attn_norm_weight,
                 norm_eps=attn_norm_eps,
             )
+            self._maybe_capture_dspark_previous_layer(residual)
+        _dspark_target_timing_record("layer_attn_mhc", stage_start)
 
         # attn_norm is fused into hc_pre / mhc_fused_post_pre above.
+        stage_start = _dspark_target_timing_start()
         x = self.attn(positions, x, None)
+        _dspark_target_timing_record("layer_attn", stage_start)
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
+        stage_start = _dspark_target_timing_start()
         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
             x,
             residual,
@@ -1453,8 +1620,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_weight=ffn_norm_weight,
             norm_eps=ffn_norm_eps,
         )
+        _dspark_target_timing_record("layer_ffn_mhc", stage_start)
 
+        stage_start = _dspark_target_timing_start()
         x = self.ffn(x, input_ids)
+        _dspark_target_timing_record("layer_ffn", stage_start)
         return x, residual, post_mix, res_mix
 
     def _forward_native(
@@ -1623,9 +1793,46 @@ class DeepseekV4Model(nn.Module):
                 layer_id: idx
                 for idx, layer_id in enumerate(self._dspark_target_layer_ids)
             }
+            self._dspark_deferred_capture_layer_ids = set()
+            if _DSPARK_DEFER_TARGET_CAPTURE:
+                self._setup_dspark_deferred_target_capture(config.hidden_size)
         else:
             self._dspark_hidden_buffer = None
             self._dspark_layer_to_buffer_index = {}
+            self._dspark_deferred_capture_layer_ids = set()
+
+    def _setup_dspark_deferred_target_capture(self, hidden_size: int) -> None:
+        assert self._dspark_hidden_buffer is not None
+        layers_by_id = {
+            extract_layer_index(layer.layer_name): layer
+            for layer in self.layers
+            if hasattr(layer, "layer_name")
+        }
+        for target_layer_id, buffer_idx in self._dspark_layer_to_buffer_index.items():
+            if target_layer_id < 0:
+                continue
+            next_layer = layers_by_id.get(target_layer_id + 1)
+            if next_layer is None or not hasattr(
+                next_layer, "set_dspark_previous_layer_capture"
+            ):
+                continue
+            start = buffer_idx * hidden_size
+            end = start + hidden_size
+            next_layer.set_dspark_previous_layer_capture(
+                self._dspark_hidden_buffer,
+                start,
+                end,
+                exact=_DSPARK_DEFER_TARGET_CAPTURE_EXACT,
+            )
+            self._dspark_deferred_capture_layer_ids.add(target_layer_id)
+        if self._dspark_deferred_capture_layer_ids:
+            mode = "exact" if _DSPARK_DEFER_TARGET_CAPTURE_EXACT else "fused"
+            logger.info_once(
+                "DeepSeek V4 DSpark deferred target-layer capture enabled for "
+                "layers %s with %s capture.",
+                tuple(sorted(self._dspark_deferred_capture_layer_ids)),
+                mode,
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1657,6 +1864,8 @@ class DeepseekV4Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        total_start = _dspark_target_timing_start()
+        stage_start = _dspark_target_timing_start()
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1666,13 +1875,17 @@ class DeepseekV4Model(nn.Module):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
+        _dspark_target_timing_record("embed_or_input", stage_start)
 
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
 
         residual, post_mix, res_mix = None, None, None
         layer = None
+        num_layers = 0
         for layer in islice(self.layers, self.start_layer, self.end_layer):
+            num_layers += 1
+            layer_start = _dspark_target_timing_start()
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1681,9 +1894,14 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
+            _dspark_target_timing_record("layers_total", layer_start)
             layer_idx = getattr(layer, "layer_name", "")
             layer_id = extract_layer_index(layer_idx) if layer_idx else None
-            if layer_id in self._dspark_layer_to_buffer_index:
+            if (
+                layer_id in self._dspark_layer_to_buffer_index
+                and layer_id not in self._dspark_deferred_capture_layer_ids
+            ):
+                stage_start = _dspark_target_timing_start()
                 if current_platform.is_cuda() and residual is not None:
                     hidden_states = layer.hc_post(
                         hidden_states, residual, post_mix, res_mix
@@ -1696,16 +1914,25 @@ class DeepseekV4Model(nn.Module):
                     self._dspark_hidden_buffer[
                         : hidden_states.shape[0], start:end
                     ].copy_(hidden_states.mean(dim=1))
+                _dspark_target_timing_record("dspark_capture", stage_start)
         if layer is not None and current_platform.is_cuda() and residual is not None:
+            stage_start = _dspark_target_timing_start()
             hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
+            _dspark_target_timing_record("final_hc_post", stage_start)
 
         if not get_pp_group().is_last_rank:
+            _dspark_target_timing_finish(
+                total_start, int(hidden_states.shape[0]), num_layers
+            )
             return IntermediateTensors({"hidden_states": hidden_states})
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]
+        stage_start = _dspark_target_timing_start()
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+        _dspark_target_timing_record("mtp_hidden_copy", stage_start)
 
+        stage_start = _dspark_target_timing_start()
         hidden_states = self.hc_head_op(
             hidden_states,
             self.hc_head_fn,
@@ -1715,6 +1942,8 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        _dspark_target_timing_record("hc_head_norm", stage_start)
+        _dspark_target_timing_finish(total_start, int(num_tokens), num_layers)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

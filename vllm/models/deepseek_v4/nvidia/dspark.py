@@ -11,6 +11,7 @@ draft block tokens, which is different from the normal MTP cache contract.
 
 from __future__ import annotations
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 
@@ -22,6 +23,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -48,7 +50,11 @@ from vllm.v1.spec_decode.dspark import (
     unpack_mhc_pre_outputs,
 )
 
-from .dspark_kernels import dspark_sparse_attention
+from .dspark_kernels import (
+    dspark_markov_argmax,
+    dspark_quant_dequant_nope,
+    dspark_sparse_attention,
+)
 from .model import (
     DeepseekV4MoE,
     make_deepseek_v4_expert_params_mapping,
@@ -57,6 +63,10 @@ from .model import (
 logger = init_logger(__name__)
 
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+
+
+def _read_bool_env(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _linear_no_bias(
@@ -69,6 +79,60 @@ def _linear_no_bias(
         assert bias is None
         return y
     return out
+
+
+def _vocab_parallel_argmax(
+    local_logits: torch.Tensor,
+    lm_head: VocabParallelEmbedding,
+) -> torch.Tensor:
+    """Return global greedy token ids from local vocab-parallel logits."""
+    num_pad = lm_head.shard_indices.num_org_vocab_padding
+    if num_pad > 0:
+        local_logits[..., -num_pad:] = -float("inf")
+
+    local_max_vals, local_max_indices = local_logits.max(dim=-1)
+    global_indices = local_max_indices + lm_head.shard_indices.org_vocab_start_index
+    return _vocab_parallel_argmax_from_local(local_max_vals, global_indices)
+
+
+def _vocab_parallel_argmax_from_local(
+    local_max_vals: torch.Tensor,
+    global_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Return global token ids from per-rank local top-1 candidates."""
+
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size == 1:
+        return global_indices.to(torch.long)
+
+    local_pair = torch.stack(
+        [local_max_vals.float(), global_indices.float()],
+        dim=-1,
+    )
+    gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
+    gathered = gathered.view(local_max_vals.shape[0], tp_size, 2)
+    max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+    top_tokens = gathered[:, :, 1].gather(dim=-1, index=max_rank_idx)
+    return top_tokens.squeeze(-1).to(torch.long)
+
+
+def _vocab_parallel_markov_argmax(
+    base_logits: torch.Tensor,
+    markov_embed: torch.Tensor,
+    markov_w2: ParallelLMHead,
+    lm_head: VocabParallelEmbedding,
+) -> torch.Tensor:
+    """Return global greedy ids for base logits plus DSpark Markov bias."""
+
+    num_pad = lm_head.shard_indices.num_org_vocab_padding
+    local_max_vals, local_max_indices = dspark_markov_argmax(
+        base_logits,
+        markov_embed,
+        markov_w2.weight,
+        num_pad=num_pad,
+    )
+    global_indices = local_max_indices + lm_head.shard_indices.org_vocab_start_index
+    return _vocab_parallel_argmax_from_local(local_max_vals, global_indices)
 
 
 class DeepSeekV4DSparkAttention(nn.Module):
@@ -101,6 +165,9 @@ class DeepSeekV4DSparkAttention(nn.Module):
         self.block_size = config.dspark_block_size
         self.eps = config.rms_norm_eps
         self.softmax_scale = self.head_dim**-0.5
+        self._reference_kv_quant_dequant = _read_bool_env(
+            "VLLM_DSPARK_REFERENCE_KV_QUANT_DEQUANT"
+        )
         cap = current_platform.get_device_capability()
         assert cap is not None, "DSpark attention requires a CUDA device"
         self._einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
@@ -190,6 +257,21 @@ class DeepSeekV4DSparkAttention(nn.Module):
             ),
             persistent=False,
         )
+        if self._reference_kv_quant_dequant:
+            logger.info(
+                "DSpark reference KV FP8 quant-dequant enabled for no-RoPE "
+                "dimensions in %s.",
+                prefix,
+            )
+
+    def _maybe_quant_dequant_kv(self, kv: torch.Tensor) -> torch.Tensor:
+        if self._reference_kv_quant_dequant:
+            return dspark_quant_dequant_nope(
+                kv,
+                rope_dim=self.rope_head_dim,
+                group_size=64,
+            )
+        return kv
 
     def _project_kv(
         self,
@@ -200,12 +282,14 @@ class DeepSeekV4DSparkAttention(nn.Module):
         _, kv = qra_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
         kv = self.kv_norm(kv)
         kv, _ = self.rotary_emb(positions, kv.unsqueeze(1), None)
-        return kv.squeeze(1)
+        kv = kv.squeeze(1)
+        return self._maybe_quant_dequant_kv(kv)
 
     def store_main_kv(
         self,
         main_x: torch.Tensor,
         main_positions: torch.Tensor,
+        num_rejected_tokens: torch.Tensor | None = None,
     ) -> None:
         if main_x.shape[1] > self.window_size:
             main_x = main_x[:, -self.window_size :]
@@ -216,10 +300,29 @@ class DeepSeekV4DSparkAttention(nn.Module):
             main_positions.reshape(batch_size * seq_len),
         ).view(batch_size, seq_len, self.head_dim)
         slots = main_positions.to(torch.long).remainder(self.window_size)
+        values = flat_kv
+        if num_rejected_tokens is not None:
+            rejected = num_rejected_tokens.to(
+                device=main_x.device,
+                dtype=torch.long,
+                non_blocking=True,
+            ).view(batch_size)
+            valid_lengths = (seq_len - rejected).clamp(min=1, max=seq_len)
+            token_offsets = torch.arange(
+                seq_len,
+                device=main_x.device,
+                dtype=torch.long,
+            ).view(1, seq_len)
+            valid_mask = token_offsets < valid_lengths.view(batch_size, 1)
+            old_values = self.main_kv_cache[:batch_size].gather(
+                1,
+                slots.unsqueeze(-1).expand(-1, -1, self.head_dim),
+            )
+            values = torch.where(valid_mask.unsqueeze(-1), flat_kv, old_values)
         self.main_kv_cache[:batch_size].scatter_(
             1,
             slots.unsqueeze(-1).expand(-1, -1, self.head_dim),
-            flat_kv,
+            values,
         )
 
     def _project_q_and_draft_kv(
@@ -235,7 +338,8 @@ class DeepSeekV4DSparkAttention(nn.Module):
         kv = self.kv_norm(kv)
         q, _ = self.rotary_emb(positions, q, None)
         kv, _ = self.rotary_emb(positions, kv.unsqueeze(1), None)
-        return q, kv.squeeze(1)
+        kv = kv.squeeze(1)
+        return q, self._maybe_quant_dequant_kv(kv)
 
     def forward_dspark(
         self,
@@ -246,8 +350,10 @@ class DeepSeekV4DSparkAttention(nn.Module):
         block_size: int,
         main_x: torch.Tensor,
         main_positions: torch.Tensor,
+        store_main_kv: bool = True,
     ) -> torch.Tensor:
-        self.store_main_kv(main_x, main_positions)
+        if store_main_kv:
+            self.store_main_kv(main_x, main_positions)
 
         q, draft_kv = self._project_q_and_draft_kv(hidden_states, positions)
         q = q.view(batch_size, block_size, self.n_local_heads, self.head_dim)
@@ -298,11 +404,25 @@ class DeepSeekV4DSparkMarkovHead(nn.Module):
     def __init__(self, vllm_config: VllmConfig, *, prefix: str) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
-        self.markov_w1 = VocabParallelEmbedding(
-            config.vocab_size,
-            config.dspark_markov_rank,
-            prefix=f"{prefix}.markov_w1",
-        )
+        self._replicated_w1 = _read_bool_env("VLLM_DSPARK_REPLICATE_MARKOV_W1")
+        if self._replicated_w1:
+            self.markov_w1 = nn.Embedding(
+                config.vocab_size,
+                config.dspark_markov_rank,
+                dtype=vllm_config.model_config.dtype,
+            )
+            self.markov_w1.weight.requires_grad_(False)
+            logger.info(
+                "DSpark replicated Markov W1 enabled for %s. This removes "
+                "the per-position vocab-parallel embedding all-reduce.",
+                prefix,
+            )
+        else:
+            self.markov_w1 = VocabParallelEmbedding(
+                config.vocab_size,
+                config.dspark_markov_rank,
+                prefix=f"{prefix}.markov_w1",
+            )
         self.markov_w2 = ParallelLMHead(
             config.vocab_size,
             config.dspark_markov_rank,
@@ -313,6 +433,18 @@ class DeepSeekV4DSparkMarkovHead(nn.Module):
     def forward(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         markov_embed = self.markov_w1(token_ids)
         markov_logits = self.logits_processor(self.markov_w2, markov_embed)
+        return markov_logits, markov_embed
+
+    def forward_local(
+        self,
+        token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        markov_embed = self.markov_w1(token_ids)
+        markov_logits = self.markov_w2.quant_method.apply(
+            self.markov_w2,
+            markov_embed,
+            bias=None,
+        )
         return markov_logits, markov_embed
 
 
@@ -476,6 +608,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
         block_size: int,
         main_x: torch.Tensor,
         main_positions: torch.Tensor,
+        store_main_kv: bool = True,
     ) -> torch.Tensor:
         residual = x
         attn_in, post, comb = unpack_mhc_pre_outputs(
@@ -491,6 +624,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
             block_size=block_size,
             main_x=main_x,
             main_positions=main_positions,
+            store_main_kv=store_main_kv,
         )
         x = self.hc_post(attn_out.to(self.dtype), residual, post, comb).to(self.dtype)
 
@@ -521,6 +655,10 @@ class DeepSeekV4DSparkModel(nn.Module):
         self.block_size = config.dspark_block_size
         self.noise_token_id = config.dspark_noise_token_id
         self.num_draft_layers = config.dspark_num_draft_layers
+        self._local_argmax = _read_bool_env("VLLM_DSPARK_LOCAL_ARGMAX")
+        self._fused_markov_argmax = _read_bool_env(
+            "VLLM_DSPARK_FUSED_MARKOV_ARGMAX"
+        )
         self.dspark_start_layer_idx = max(
             config.num_hidden_layers,
             max(getattr(config, "dspark_target_layer_ids", [-1])) + 1,
@@ -544,6 +682,17 @@ class DeepSeekV4DSparkModel(nn.Module):
                 for stage_id, layer_key in enumerate(self.stage_layer_keys)
             }
         )
+        if self._local_argmax:
+            logger.info(
+                "DSpark local vocab-parallel argmax is enabled. This is "
+                "experimental and may add per-position synchronization overhead."
+            )
+        if self._fused_markov_argmax:
+            logger.info(
+                "DSpark fused Markov argmax is enabled. This keeps the paper's "
+                "low-rank Markov bias but avoids materializing Markov logits "
+                "on the greedy no-confidence draft path."
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -556,11 +705,16 @@ class DeepSeekV4DSparkModel(nn.Module):
         self,
         main_hidden: torch.Tensor,
         main_positions: torch.Tensor,
+        num_rejected_tokens: torch.Tensor | None = None,
     ) -> None:
         main_x = self.project_main(main_hidden.reshape(-1, main_hidden.shape[-1]))
         main_x = main_x.view(*main_hidden.shape[:-1], self.config.hidden_size)
         for layer in self.layers.values():
-            layer.attn.store_main_kv(main_x, main_positions)
+            layer.attn.store_main_kv(
+                main_x,
+                main_positions,
+                num_rejected_tokens=num_rejected_tokens,
+            )
 
     def draft(
         self,
@@ -572,13 +726,14 @@ class DeepSeekV4DSparkModel(nn.Module):
         *,
         return_logits: bool = True,
         return_confidence: bool = True,
+        store_main_kv: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = input_ids.shape[0]
         block_size = self.block_size
+        main_positions = main_positions.view(batch_size, 1)
         main_x = self.project_main(main_hidden).view(
             batch_size, 1, self.config.hidden_size
         )
-        main_positions = main_positions.view(batch_size, 1)
 
         draft_input_ids = input_ids.new_full(
             (batch_size, block_size), self.noise_token_id
@@ -589,9 +744,12 @@ class DeepSeekV4DSparkModel(nn.Module):
         )
         x = x.unsqueeze(1).repeat(1, self.config.hc_mult, 1)
 
+        # DeepSpec trains/evaluates DSpark with the anchor token itself at the
+        # first draft position: anchor + [0, gamma). The hidden state at that
+        # anchor position predicts the next token.
         offsets = torch.arange(
-            1,
-            block_size + 1,
+            0,
+            block_size,
             dtype=main_positions.dtype,
             device=main_positions.device,
         )
@@ -606,6 +764,7 @@ class DeepSeekV4DSparkModel(nn.Module):
                 block_size=block_size,
                 main_x=main_x,
                 main_positions=main_positions,
+                store_main_kv=store_main_kv,
             )
 
         final_layer = self.layers[self.stage_layer_keys[-1]]
@@ -613,6 +772,53 @@ class DeepSeekV4DSparkModel(nn.Module):
             batch_size, block_size, self.config.hidden_size
         )
         normed = final_layer.norm(dense.reshape(batch_size * block_size, -1))
+
+        if not return_logits and getattr(self, "_local_argmax", False):
+            local_logits = lm_head.quant_method.apply(
+                lm_head,
+                normed,
+                bias=None,
+            ).view(batch_size, block_size, -1)
+            output_ids = input_ids.new_empty(batch_size, block_size + 1)
+            output_ids[:, 0] = input_ids
+            markov_embeds = [] if return_confidence else None
+            for pos in range(block_size):
+                if markov_embeds is not None:
+                    markov_logits, markov_embed = (
+                        final_layer.markov_head.forward_local(output_ids[:, pos])
+                    )
+                    markov_embeds.append(markov_embed)
+                    step_logits = local_logits[:, pos] + markov_logits
+                    output_ids[:, pos + 1] = _vocab_parallel_argmax(
+                        step_logits,
+                        lm_head,
+                    )
+                elif getattr(self, "_fused_markov_argmax", False):
+                    markov_embed = final_layer.markov_head.markov_w1(output_ids[:, pos])
+                    output_ids[:, pos + 1] = _vocab_parallel_markov_argmax(
+                        local_logits[:, pos],
+                        markov_embed,
+                        final_layer.markov_head.markov_w2,
+                        lm_head,
+                    )
+                else:
+                    markov_logits, _ = final_layer.markov_head.forward_local(
+                        output_ids[:, pos]
+                    )
+                    step_logits = local_logits[:, pos] + markov_logits
+                    output_ids[:, pos + 1] = _vocab_parallel_argmax(
+                        step_logits,
+                        lm_head,
+                    )
+            logits = normed.new_empty((0, 0, 0))
+            if return_confidence:
+                assert markov_embeds is not None
+                markov_embed = torch.stack(markov_embeds, dim=1)
+                confidence = final_layer.confidence_head(dense, markov_embed).sigmoid()
+            else:
+                confidence = dense.new_empty((batch_size, 0), dtype=torch.float32)
+            return output_ids[:, 1:], logits, confidence
+
         logits = logits_processor(lm_head, normed).view(
             batch_size, block_size, self.config.vocab_size
         )
@@ -666,14 +872,21 @@ class DeepSeekV4DSpark(nn.Module):
         self,
         main_hidden: torch.Tensor,
         main_positions: torch.Tensor,
+        num_rejected_tokens: torch.Tensor | None = None,
     ) -> None:
-        self.model.prefill_main(main_hidden, main_positions)
+        self.model.prefill_main(
+            main_hidden,
+            main_positions,
+            num_rejected_tokens=num_rejected_tokens,
+        )
 
     def draft(
         self,
         input_ids: torch.Tensor,
         main_hidden: torch.Tensor,
         main_positions: torch.Tensor,
+        *,
+        store_main_kv: bool = True,
     ) -> torch.Tensor:
         draft_ids, _logits, confidence = self.model.draft(
             input_ids,
@@ -681,6 +894,7 @@ class DeepSeekV4DSpark(nn.Module):
             main_positions,
             self.lm_head,
             self.logits_processor,
+            store_main_kv=store_main_kv,
         )
         self._last_confidence = confidence
         return draft_ids
@@ -693,6 +907,7 @@ class DeepSeekV4DSpark(nn.Module):
         *,
         return_logits: bool = True,
         return_confidence: bool = True,
+        store_main_kv: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         draft_ids, logits, confidence = self.model.draft(
             input_ids,
@@ -702,6 +917,7 @@ class DeepSeekV4DSpark(nn.Module):
             self.logits_processor,
             return_logits=return_logits,
             return_confidence=return_confidence,
+            store_main_kv=store_main_kv,
         )
         return draft_ids, logits, confidence
 

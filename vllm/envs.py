@@ -64,6 +64,9 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_FP8_GEMM: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
+    VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM: int = 0
+    VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M: int = 16
+    VLLM_B12X_W4A16_FORCE_TILE_CONFIG: str = ""
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -186,6 +189,17 @@ if TYPE_CHECKING:
     ] = "relax"
     VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP: bool = True
     VLLM_DSPARK_CONFIDENCE_THRESHOLD: str = "0.0"
+    VLLM_DSPARK_FORCE_DRAFT_LENGTH: str = ""
+    VLLM_DSPARK_REPLICATE_MARKOV_W1: bool = False
+    VLLM_DSPARK_STAGE_TIMING: bool = False
+    VLLM_DSPARK_STAGE_TIMING_LOG_EVERY: int = 20
+    VLLM_DSPARK_ITER_TIMING: bool = False
+    VLLM_DSPARK_ITER_TIMING_LOG_EVERY: int = 20
+    VLLM_DSPARK_TARGET_TIMING: bool = False
+    VLLM_DSPARK_TARGET_TIMING_LOG_EVERY: int = 20
+    VLLM_DSV4_B12X_COMPRESSED_MLA: bool = False
+    VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE: bool = False
+    VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE_EXACT: bool = False
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_FP16: bool = False
@@ -1006,9 +1020,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Use b12x for DeepSeek V4 mHC pre/post residual mixing.
     # This is opt-in while the b12x subsystems are brought over one at a time.
-    "VLLM_USE_B12X_MHC": lambda: bool(
-        int(os.getenv("VLLM_USE_B12X_MHC", "0"))
-    ),
+    "VLLM_USE_B12X_MHC": lambda: bool(int(os.getenv("VLLM_USE_B12X_MHC", "0"))),
     # Use b12x for block-scaled FP8 linear GEMMs.
     # This is opt-in while the b12x subsystems are brought over one at a time.
     "VLLM_USE_B12X_FP8_GEMM": lambda: bool(
@@ -1021,8 +1033,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Use b12x for DeepSeek V4 MXFP4 MoE experts.
     # This is opt-in while the b12x subsystems are brought over one at a time.
-    "VLLM_USE_B12X_MOE": lambda: bool(
-        int(os.getenv("VLLM_USE_B12X_MOE", "0"))
+    "VLLM_USE_B12X_MOE": lambda: bool(int(os.getenv("VLLM_USE_B12X_MOE", "0"))),
+    # Experimental B12X W4A16 MoE selector override for DSpark decode A/Bs.
+    # 0 keeps the upstream selector result unchanged.
+    "VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM": lambda: int(
+        os.getenv("VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM", "0")
+    ),
+    "VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M": lambda: int(
+        os.getenv("VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M", "16")
+    ),
+    "VLLM_B12X_W4A16_FORCE_TILE_CONFIG": lambda: os.getenv(
+        "VLLM_B12X_W4A16_FORCE_TILE_CONFIG", ""
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
@@ -1464,6 +1485,81 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Parsed and range-checked by DSparkProposer.
     "VLLM_DSPARK_CONFIDENCE_THRESHOLD": lambda: os.getenv(
         "VLLM_DSPARK_CONFIDENCE_THRESHOLD", "0.0"
+    ),
+    "VLLM_DSPARK_CONFIDENCE_SCHEDULER": lambda: os.getenv(
+        "VLLM_DSPARK_CONFIDENCE_SCHEDULER", "auto"
+    ),
+    "VLLM_DSPARK_SPS_CURVE": lambda: os.getenv("VLLM_DSPARK_SPS_CURVE", ""),
+    "VLLM_DSPARK_HARDWARE_SCHEDULER_EARLY_STOP": lambda: os.getenv(
+        "VLLM_DSPARK_HARDWARE_SCHEDULER_EARLY_STOP", "1"
+    ),
+    "VLLM_DSPARK_FORCE_DRAFT_LENGTH": lambda: os.getenv(
+        "VLLM_DSPARK_FORCE_DRAFT_LENGTH", ""
+    ),
+    "VLLM_DSPARK_EXPORT_DRAFT_PROBS": lambda: (
+        os.getenv("VLLM_DSPARK_EXPORT_DRAFT_PROBS", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DSPARK_COLLECT_CONFIDENCE_DIAGNOSTICS": lambda: (
+        os.getenv("VLLM_DSPARK_COLLECT_CONFIDENCE_DIAGNOSTICS", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DSPARK_POSITION0_DIAGNOSTICS": lambda: (
+        os.getenv("VLLM_DSPARK_POSITION0_DIAGNOSTICS", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DSPARK_LOCAL_ARGMAX": lambda: (
+        os.getenv("VLLM_DSPARK_LOCAL_ARGMAX", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DSPARK_FUSED_MARKOV_ARGMAX": lambda: (
+        os.getenv("VLLM_DSPARK_FUSED_MARKOV_ARGMAX", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK": lambda: (
+        os.getenv("VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DSPARK_REFERENCE_KV_QUANT_DEQUANT": lambda: (
+        os.getenv("VLLM_DSPARK_REFERENCE_KV_QUANT_DEQUANT", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DSPARK_REPLICATE_MARKOV_W1": lambda: (
+        os.getenv("VLLM_DSPARK_REPLICATE_MARKOV_W1", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DSPARK_STAGE_TIMING": lambda: (
+        os.getenv("VLLM_DSPARK_STAGE_TIMING", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DSPARK_STAGE_TIMING_LOG_EVERY": lambda: int(
+        os.getenv("VLLM_DSPARK_STAGE_TIMING_LOG_EVERY", "20")
+    ),
+    "VLLM_DSPARK_ITER_TIMING": lambda: (
+        os.getenv("VLLM_DSPARK_ITER_TIMING", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DSPARK_ITER_TIMING_LOG_EVERY": lambda: int(
+        os.getenv("VLLM_DSPARK_ITER_TIMING_LOG_EVERY", "20")
+    ),
+    "VLLM_DSPARK_TARGET_TIMING": lambda: (
+        os.getenv("VLLM_DSPARK_TARGET_TIMING", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DSPARK_TARGET_TIMING_LOG_EVERY": lambda: int(
+        os.getenv("VLLM_DSPARK_TARGET_TIMING_LOG_EVERY", "20")
+    ),
+    "VLLM_DSV4_B12X_COMPRESSED_MLA": lambda: (
+        os.getenv("VLLM_DSV4_B12X_COMPRESSED_MLA", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE": lambda: (
+        os.getenv("VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE_EXACT": lambda: (
+        os.getenv("VLLM_DSV4_DSPARK_DEFER_TARGET_CAPTURE_EXACT", "0").strip().lower()
+        in ("1", "true", "yes", "on")
     ),
     # Whether to use fused grouped_topk used for MoE expert selection.
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(

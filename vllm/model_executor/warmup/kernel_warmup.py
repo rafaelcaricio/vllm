@@ -39,8 +39,19 @@ _DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
 _DEEPSEEK_V4_SPARSE_MLA_MIXED_WARMUP_TOKENS = 16
 _DEEPSEEK_V4_SPARSE_MLA_PREFILL_WARMUP_TOKENS = 8192
 _DEEPSEEK_V4_DSPARK_DECODE_AUTOTUNE_SEQ_LENS = (512, 2048)
-_DEEPSEEK_V4_DSPARK_SHORT_PREFILL_WARMUP_TOKENS = (20, 32)
-_DEEPSEEK_V4_DSPARK_ROUTE_PACK_PREFILL_TOKENS = (512, 513, 1024)
+_DEEPSEEK_V4_DSPARK_SHORT_PREFILL_WARMUP_TOKENS = (12, 16, 20, 32)
+_DEEPSEEK_V4_DSPARK_ROUTE_PACK_PREFILL_TOKENS = (
+    # The single-stream coding benchmark targets a 512-token prompt, but the
+    # chat template makes the served prompt land near 415 tokens. B12X route-pack
+    # kernels specialize on exact packed-route workspace sizes, not only the
+    # next power-of-two capacity, so warm the observed prompt neighborhood too.
+    411,
+    415,
+    416,
+    512,
+    513,
+    1024,
+)
 
 # Fan of num_tokens specializations to pre-JIT for
 # `_compute_slot_mapping_kernel`. On SM12x cold JIT can emit
@@ -205,7 +216,10 @@ def _deepseek_v4_b12x_route_pack_warmup(worker: "Worker") -> None:
         return
 
     try:
-        from b12x.moe.fused.w4a16.host import select_route_block_size_m
+        from b12x.moe.fused.w4a16.host import (
+            max_packed_route_slots,
+            select_route_block_size_m,
+        )
         from b12x.moe.fused.w4a16.kernel import pack_topk_routes_by_expert
     except ImportError:
         logger.debug("Skipping B12X route-pack warmup: package is unavailable.")
@@ -217,7 +231,31 @@ def _deepseek_v4_b12x_route_pack_warmup(worker: "Worker") -> None:
         topk_ids = torch.zeros(
             (token_count, top_k), dtype=torch.int32, device=device
         )
-        pack_topk_routes_by_expert(topk_ids, block_size_m, num_experts)
+        route_id_shapes = (topk_ids, topk_ids.view(-1))
+        for route_ids in route_id_shapes:
+            pack_topk_routes_by_expert(route_ids, block_size_m, num_experts)
+
+            routed_rows = int(route_ids.numel())
+            route_slots = max(
+                1,
+                max_packed_route_slots(routed_rows, block_size_m, num_experts),
+            )
+            route_blocks = max(1, (route_slots + block_size_m - 1) // block_size_m)
+            pack_topk_routes_by_expert(
+                route_ids,
+                block_size_m,
+                num_experts,
+                packed_route_indices=torch.empty(
+                    (route_slots,), dtype=torch.int32, device=device
+                ),
+                block_expert_ids=torch.empty(
+                    (route_blocks,), dtype=torch.int32, device=device
+                ),
+                packed_route_count=torch.empty(1, dtype=torch.int32, device=device),
+                expert_offsets=torch.empty(
+                    (num_experts + 1,), dtype=torch.int32, device=device
+                ),
+            )
 
 
 @torch.inference_mode()
@@ -235,16 +273,9 @@ def _deepseek_v4_spec_decode_padded_kernel_warmup(worker: "Worker") -> None:
     runner = worker.model_runner
     device = runner.device
     vocab_size = _runner_vocab_size(runner)
-    block_size_tokens = 1 << (query_len - 1).bit_length()
-
     next_token_kernel, inputs_kernel = _spec_decode_padded_warmup_kernels()
 
     for num_reqs in _dspark_warmup_request_counts(worker):
-        sampled_token_ids = torch.zeros(
-            (num_reqs, query_len), dtype=torch.int32, device=device
-        )
-        if query_len > 1:
-            sampled_token_ids[:, -1] = -1
         discard_buffer = getattr(
             getattr(runner, "discard_request_mask", None), "gpu", None
         )
@@ -266,23 +297,34 @@ def _deepseek_v4_spec_decode_padded_kernel_warmup(worker: "Worker") -> None:
         else:
             backup_tokens = torch.zeros(num_reqs, dtype=torch.int32, device=device)
 
-        next_token_ids = torch.empty(num_reqs, dtype=torch.int32, device=device)
-        valid_sampled_tokens_count = torch.empty(
-            num_reqs, dtype=torch.int32, device=device
-        )
+        valid_sampled_tokens_count = None
+        for sample_width in range(1, query_len + 1):
+            sampled_token_ids = torch.zeros(
+                (num_reqs, sample_width), dtype=torch.int32, device=device
+            )
+            if sample_width > 1:
+                sampled_token_ids[:, -1] = -1
 
-        next_token_kernel[(num_reqs,)](
-            sampled_token_ids,
-            discard_request_mask,
-            backup_tokens,
-            next_token_ids,
-            valid_sampled_tokens_count,
-            vocab_size,
-            query_len,
-            num_reqs,
-            sampled_token_ids.stride(0),
-            BLOCK_SIZE_TOKENS=block_size_tokens,
-        )
+            next_token_ids = torch.empty(num_reqs, dtype=torch.int32, device=device)
+            valid_sampled_tokens_count = torch.empty(
+                num_reqs, dtype=torch.int32, device=device
+            )
+            block_size_tokens = 1 << (sample_width - 1).bit_length()
+
+            next_token_kernel[(num_reqs,)](
+                sampled_token_ids,
+                discard_request_mask,
+                backup_tokens,
+                next_token_ids,
+                valid_sampled_tokens_count,
+                vocab_size,
+                sample_width,
+                num_reqs,
+                sampled_token_ids.stride(0),
+                BLOCK_SIZE_TOKENS=block_size_tokens,
+            )
+
+        assert valid_sampled_tokens_count is not None
 
         cu_num_draft_tokens = torch.arange(
             query_len - 1,

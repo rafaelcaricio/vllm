@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import torch
@@ -19,6 +20,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.dspark import (
     DSparkDiagnostics,
     confidence_threshold_prefix_length,
+    hardware_aware_prefix_schedule,
     make_dspark_warmup_draft_token_ids,
     score_prefix_lengths,
 )
@@ -78,17 +80,51 @@ class DSparkProposer(SpecDecodeBaseProposer):
             max_spec_tokens=self.num_speculative_tokens
         )
         self.confidence_threshold = self._read_confidence_threshold()
+        self.confidence_scheduler = self._read_confidence_scheduler(
+            self.confidence_threshold
+        )
+        self._forced_draft_length = self._read_forced_draft_length(
+            self.num_speculative_tokens
+        )
+        self._sps_curve = self._read_sps_curve()
+        self._hardware_scheduler_early_stop = (
+            self._read_hardware_scheduler_early_stop()
+        )
         self._last_draft_lengths: list[int] | None = None
         self._last_draft_probs: torch.Tensor | None = None
         self._export_draft_probs = self._read_export_draft_probs()
         self._collect_confidence_diagnostics = (
             self._read_collect_confidence_diagnostics()
         )
+        self._collect_position0_diagnostics = (
+            self._read_position0_diagnostics()
+        )
+        self._gpu_rejected_context_mask = (
+            self._read_gpu_rejected_context_mask()
+        )
+        self._stage_timing = self._read_stage_timing()
+        self._stage_timing_log_every = self._read_stage_timing_log_every()
+        self._stage_timing_count = 0
+        self._stage_timing_totals_ms: dict[str, float] = {}
+        self._last_confidence: torch.Tensor | None = None
         if self.confidence_threshold > 0.0:
             logger.info(
                 "DSpark confidence-scheduled verification enabled with "
                 "threshold %.4f.",
                 self.confidence_threshold,
+            )
+        if self.confidence_scheduler == "hardware":
+            logger.info(
+                "DSpark hardware-aware confidence scheduler enabled with "
+                "early_stop=%s and SPS curve=%s.",
+                self._hardware_scheduler_early_stop,
+                self._sps_curve or "constant",
+            )
+        if self._forced_draft_length is not None:
+            logger.info(
+                "DSpark forced draft verification length enabled for "
+                "profiling: %d.",
+                self._forced_draft_length,
             )
         if self._export_draft_probs:
             logger.info(
@@ -99,6 +135,23 @@ class DSparkProposer(SpecDecodeBaseProposer):
             logger.info(
                 "DSpark confidence diagnostics enabled. This copies confidence "
                 "scores to CPU on every draft step."
+            )
+        if self._collect_position0_diagnostics:
+            logger.info(
+                "DSpark position-0 diagnostics enabled. The confidence head "
+                "runs on every draft step; the runner logs first-token "
+                "target-argmax agreement."
+            )
+        if self._gpu_rejected_context_mask:
+            logger.info(
+                "DSpark GPU rejected-context mask enabled. Rejected target "
+                "suffix rows are masked during draft main-KV cache update "
+                "without synchronizing rejection counts to CPU."
+            )
+        if self._stage_timing:
+            logger.info(
+                "DSpark stage timing enabled. This synchronizes CUDA work and "
+                "is intended for diagnostics, not speed-gate benchmarks."
             )
         if not self._needs_draft_logits() and not self._needs_confidence():
             logger.info(
@@ -124,6 +177,98 @@ class DSparkProposer(SpecDecodeBaseProposer):
         return threshold
 
     @staticmethod
+    def _read_confidence_scheduler(confidence_threshold: float) -> str:
+        raw = os.getenv("VLLM_DSPARK_CONFIDENCE_SCHEDULER", "auto")
+        scheduler = raw.strip().lower()
+        if scheduler in {"", "auto"}:
+            return "threshold" if confidence_threshold > 0.0 else "off"
+        if scheduler not in {"off", "threshold", "hardware"}:
+            raise ValueError(
+                "VLLM_DSPARK_CONFIDENCE_SCHEDULER must be one of "
+                "'off', 'threshold', 'hardware', or 'auto', "
+                f"got {raw!r}"
+            )
+        return scheduler
+
+    @staticmethod
+    def _read_forced_draft_length(max_draft_length: int) -> int | None:
+        raw = os.getenv("VLLM_DSPARK_FORCE_DRAFT_LENGTH", "").strip()
+        if raw == "":
+            return None
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_DSPARK_FORCE_DRAFT_LENGTH must be an integer in "
+                f"[0, {max_draft_length}] or empty, got {raw!r}"
+            ) from exc
+        if value < 0 or value > max_draft_length:
+            raise ValueError(
+                "VLLM_DSPARK_FORCE_DRAFT_LENGTH must be in "
+                f"[0, {max_draft_length}], got {value}"
+            )
+        return value
+
+    @staticmethod
+    def _read_sps_curve() -> tuple[tuple[int, float], ...]:
+        raw = os.getenv("VLLM_DSPARK_SPS_CURVE", "").strip()
+        if not raw:
+            return ()
+
+        entries: dict[int, float] = {}
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                batch_tokens_raw, rate_raw = item.split(":", 1)
+                batch_tokens = int(batch_tokens_raw)
+                rate = float(rate_raw)
+            except ValueError as exc:
+                raise ValueError(
+                    "VLLM_DSPARK_SPS_CURVE must be a comma-separated table "
+                    "of '<batch_tokens>:<steps_per_second>' entries, "
+                    f"got {raw!r}"
+                ) from exc
+            if batch_tokens <= 0:
+                raise ValueError(
+                    "VLLM_DSPARK_SPS_CURVE batch-token keys must be positive, "
+                    f"got {batch_tokens}"
+                )
+            if rate < 0.0:
+                raise ValueError(
+                    "VLLM_DSPARK_SPS_CURVE rates must be non-negative, "
+                    f"got {rate}"
+                )
+            entries[batch_tokens] = rate
+        return tuple(sorted(entries.items()))
+
+    @staticmethod
+    def _read_hardware_scheduler_early_stop() -> bool:
+        raw = os.getenv("VLLM_DSPARK_HARDWARE_SCHEDULER_EARLY_STOP", "1")
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _steps_per_second(self, batch_tokens: int) -> float:
+        curve = getattr(self, "_sps_curve", ())
+        if not curve:
+            return 1.0
+
+        batch_tokens = int(batch_tokens)
+        selected_rate = curve[0][1]
+        for profiled_tokens, rate in curve:
+            if batch_tokens < profiled_tokens:
+                break
+            selected_rate = rate
+        return selected_rate
+
+    def _effective_confidence_scheduler(self) -> str:
+        scheduler = getattr(self, "confidence_scheduler", None)
+        if scheduler is not None:
+            return scheduler
+        threshold = getattr(self, "confidence_threshold", 0.0)
+        return "threshold" if threshold > 0.0 else "off"
+
+    @staticmethod
     def _read_export_draft_probs() -> bool:
         raw = os.getenv("VLLM_DSPARK_EXPORT_DRAFT_PROBS", "0")
         return raw.strip().lower() in {"1", "true", "yes", "on"}
@@ -132,6 +277,81 @@ class DSparkProposer(SpecDecodeBaseProposer):
     def _read_collect_confidence_diagnostics() -> bool:
         raw = os.getenv("VLLM_DSPARK_COLLECT_CONFIDENCE_DIAGNOSTICS", "0")
         return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _read_position0_diagnostics() -> bool:
+        raw = os.getenv("VLLM_DSPARK_POSITION0_DIAGNOSTICS", "0")
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _read_gpu_rejected_context_mask() -> bool:
+        raw = os.getenv("VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK", "0")
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _read_stage_timing() -> bool:
+        raw = os.getenv("VLLM_DSPARK_STAGE_TIMING", "0")
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _read_stage_timing_log_every() -> int:
+        raw = os.getenv("VLLM_DSPARK_STAGE_TIMING_LOG_EVERY", "20")
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_DSPARK_STAGE_TIMING_LOG_EVERY must be an integer, "
+                f"got {raw!r}"
+            ) from exc
+        return max(1, value)
+
+    def _record_stage_timing(self, name: str, elapsed_ms: float) -> None:
+        self._stage_timing_totals_ms[name] = (
+            self._stage_timing_totals_ms.get(name, 0.0) + float(elapsed_ms)
+        )
+
+    def _timed_stage(self, name: str, fn):
+        if not getattr(self, "_stage_timing", False):
+            return fn()
+        if self.device.type != "cuda":
+            started = time.perf_counter()
+            result = fn()
+            self._record_stage_timing(name, (time.perf_counter() - started) * 1000.0)
+            return result
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        result = fn()
+        end.record()
+        end.synchronize()
+        self._record_stage_timing(name, start.elapsed_time(end))
+        return result
+
+    def _maybe_log_stage_timing(self) -> None:
+        if not getattr(self, "_stage_timing", False):
+            return
+        self._stage_timing_count += 1
+        if self._stage_timing_count % self._stage_timing_log_every != 0:
+            return
+
+        names = (
+            "context_prepare",
+            "prefill_main",
+            "graph_prepare",
+            "draft",
+            "postprocess",
+            "total",
+        )
+        parts = []
+        for name in names:
+            total_ms = self._stage_timing_totals_ms.get(name, 0.0)
+            parts.append(f"{name}={total_ms / self._stage_timing_count:.3f}ms")
+        logger.info(
+            "DSpark stage timing avg over %d proposals: %s",
+            self._stage_timing_count,
+            ", ".join(parts),
+        )
 
     @override
     def initialize_attn_backend(
@@ -267,6 +487,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
             self._draft_positions_buffer[:batch_size],
             return_logits=self._needs_draft_logits(),
             return_confidence=self._needs_confidence(),
+            store_main_kv=False,
         )
 
     def _run_draft_for_current_context(
@@ -376,38 +597,72 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self,
         confidence_rows: list[list[float]],
     ) -> list[int]:
-        if self.confidence_threshold <= 0.0:
-            return [
+        return list(self._schedule_from_confidence(confidence_rows).lengths)
+
+    def _schedule_from_confidence(
+        self,
+        confidence_rows: list[list[float]],
+    ):
+        confidence_rows = [
+            row[: self.num_speculative_tokens] for row in confidence_rows
+        ]
+        forced_length = getattr(self, "_forced_draft_length", None)
+        if forced_length is not None:
+            lengths = [
+                min(int(forced_length), self.num_speculative_tokens, len(row))
+                for row in confidence_rows
+            ]
+            return score_prefix_lengths(
+                confidence_rows,
+                lengths,
+                steps_per_second=self._steps_per_second,
+            )
+
+        scheduler = self._effective_confidence_scheduler()
+
+        if scheduler == "hardware":
+            return hardware_aware_prefix_schedule(
+                confidence_rows,
+                steps_per_second=self._steps_per_second,
+                early_stop=getattr(self, "_hardware_scheduler_early_stop", True),
+            )
+
+        if scheduler == "off" or self.confidence_threshold <= 0.0:
+            lengths = [
                 min(self.num_speculative_tokens, len(row))
                 for row in confidence_rows
             ]
-        return [
-            confidence_threshold_prefix_length(
-                row[: self.num_speculative_tokens],
-                self.confidence_threshold,
-            )
-            for row in confidence_rows
-        ]
+        else:
+            lengths = [
+                confidence_threshold_prefix_length(
+                    row,
+                    self.confidence_threshold,
+                )
+                for row in confidence_rows
+            ]
+        return score_prefix_lengths(
+            confidence_rows,
+            lengths,
+            steps_per_second=self._steps_per_second,
+        )
 
     def _observe_confidence(self, confidence: torch.Tensor) -> list[int]:
         confidence_rows = confidence.detach().float().cpu().tolist()
-        lengths = self._draft_lengths_from_confidence(confidence_rows)
-        schedule = score_prefix_lengths(
-            confidence_rows,
-            lengths,
-            steps_per_second=lambda _batch_tokens: 1.0,
-        )
+        schedule = self._schedule_from_confidence(confidence_rows)
         self.diagnostics.observe(confidence_rows, schedule)
-        return lengths
+        return list(schedule.lengths)
 
     def _should_observe_confidence(self) -> bool:
         return (
-            self.confidence_threshold > 0.0
-            or self._collect_confidence_diagnostics
+            self._effective_confidence_scheduler() != "off"
+            or getattr(self, "_collect_confidence_diagnostics", False)
         )
 
     def _needs_confidence(self) -> bool:
-        return self._should_observe_confidence()
+        return (
+            self._should_observe_confidence()
+            or getattr(self, "_collect_position0_diagnostics", False)
+        )
 
     def _needs_draft_logits(self) -> bool:
         return self._export_draft_probs
@@ -421,6 +676,11 @@ class DSparkProposer(SpecDecodeBaseProposer):
         draft_probs = self._last_draft_probs
         self._last_draft_probs = None
         return draft_probs
+
+    def take_last_confidence(self) -> torch.Tensor | None:
+        confidence = self._last_confidence
+        self._last_confidence = None
+        return confidence
 
     def _maybe_store_draft_probs(
         self,
@@ -472,35 +732,104 @@ class DSparkProposer(SpecDecodeBaseProposer):
             slot_mappings,
         )
         self._last_draft_probs = None
+        self._last_confidence = None
+        total_started = time.perf_counter()
         batch_size = self._batch_size(next_token_ids)
-        target_hidden_states, target_positions = self._trim_rejected_target_context(
-            target_hidden_states,
-            target_positions,
-            common_attn_metadata,
-            num_rejected_tokens_gpu,
-        )
-        hidden_by_req = self._view_by_request(target_hidden_states, batch_size)
-        positions_by_req = self._positions_by_request(target_positions, batch_size)
 
-        self.model.prefill_main(hidden_by_req, positions_by_req)
+        def prepare_context():
+            nonlocal target_hidden_states, target_positions
+            rejected_for_gpu_mask = None
+            if (
+                getattr(self, "_gpu_rejected_context_mask", False)
+                and num_rejected_tokens_gpu is not None
+            ):
+                rejected_for_gpu_mask = num_rejected_tokens_gpu
+            else:
+                target_hidden_states, target_positions = (
+                    self._trim_rejected_target_context(
+                        target_hidden_states,
+                        target_positions,
+                        common_attn_metadata,
+                        num_rejected_tokens_gpu,
+                    )
+                )
+            hidden_by_req = self._view_by_request(target_hidden_states, batch_size)
+            positions_by_req = self._positions_by_request(target_positions, batch_size)
+
+            if rejected_for_gpu_mask is not None:
+                rejected = rejected_for_gpu_mask.to(
+                    device=hidden_by_req.device,
+                    dtype=torch.long,
+                    non_blocking=True,
+                ).view(batch_size)
+                last_indices = (
+                    hidden_by_req.shape[1] - rejected - 1
+                ).clamp(min=0)
+                last_hidden = hidden_by_req.gather(
+                    1,
+                    last_indices.view(batch_size, 1, 1).expand(
+                        -1,
+                        -1,
+                        hidden_by_req.shape[-1],
+                    ),
+                ).squeeze(1).contiguous()
+                last_positions = positions_by_req.gather(
+                    1,
+                    last_indices.view(batch_size, 1),
+                ).squeeze(1).contiguous()
+            else:
+                last_hidden = hidden_by_req[:, -1].contiguous()
+                last_positions = positions_by_req[:, -1].contiguous()
+            return hidden_by_req, positions_by_req, last_hidden, last_positions, (
+                rejected_for_gpu_mask
+            )
+
+        (
+            hidden_by_req,
+            positions_by_req,
+            last_hidden,
+            last_positions,
+            rejected_for_gpu_mask,
+        ) = self._timed_stage("context_prepare", prepare_context)
+
+        self._timed_stage(
+            "prefill_main",
+            lambda: self.model.prefill_main(
+                hidden_by_req,
+                positions_by_req,
+                num_rejected_tokens=rejected_for_gpu_mask,
+            ),
+        )
         if not self._prefilled:
             self._prefilled = True
             return self._warmup_drafts(batch_size)
 
-        last_hidden = hidden_by_req[:, -1].contiguous()
-        last_positions = positions_by_req[:, -1].contiguous()
+        def prepare_graph():
+            (
+                cudagraph_runtime_mode,
+                padded_batch_size,
+                num_tokens_across_dp,
+                batch_descriptor,
+            ) = self._determine_graph_batch(batch_size)
+            self._prepare_draft_buffers(
+                input_ids=next_token_ids,
+                hidden_states=last_hidden,
+                positions=last_positions,
+                padded_batch_size=padded_batch_size,
+            )
+            return (
+                cudagraph_runtime_mode,
+                padded_batch_size,
+                num_tokens_across_dp,
+                batch_descriptor,
+            )
+
         (
             cudagraph_runtime_mode,
             padded_batch_size,
             num_tokens_across_dp,
             batch_descriptor,
-        ) = self._determine_graph_batch(batch_size)
-        self._prepare_draft_buffers(
-            input_ids=next_token_ids,
-            hidden_states=last_hidden,
-            positions=last_positions,
-            padded_batch_size=padded_batch_size,
-        )
+        ) = self._timed_stage("graph_prepare", prepare_graph)
         with set_forward_context(
             None,
             self.vllm_config,
@@ -510,22 +839,41 @@ class DSparkProposer(SpecDecodeBaseProposer):
             batch_descriptor=batch_descriptor,
         ):
             draft_token_ids, draft_logits, confidence = (
-                self._run_draft_for_current_context()
+                self._timed_stage("draft", self._run_draft_for_current_context)
             )
-        self._maybe_store_draft_probs(draft_logits, sampling_metadata, batch_size)
-        if (
-            confidence is not None
-            and confidence.numel() > 0
-            and self._should_observe_confidence()
-        ):
-            self._last_draft_lengths = self._observe_confidence(
-                confidence[:batch_size]
+
+        def postprocess():
+            self._maybe_store_draft_probs(draft_logits, sampling_metadata, batch_size)
+            confidence_for_batch = None
+            if confidence is not None and confidence.numel() > 0:
+                confidence_for_batch = confidence[
+                    :batch_size, : self.num_speculative_tokens
+                ]
+                if getattr(self, "_collect_position0_diagnostics", False):
+                    self._last_confidence = confidence_for_batch.detach().clone()
+            forced_length = getattr(self, "_forced_draft_length", None)
+            if forced_length is not None:
+                self._last_draft_lengths = [int(forced_length)] * batch_size
+            elif (
+                confidence_for_batch is not None
+                and self._should_observe_confidence()
+            ):
+                self._last_draft_lengths = self._observe_confidence(
+                    confidence_for_batch
+                )
+            else:
+                self._last_draft_lengths = [self.num_speculative_tokens] * batch_size
+            return draft_token_ids[:batch_size, : self.num_speculative_tokens].to(
+                torch.int32
             )
-        else:
-            self._last_draft_lengths = [self.num_speculative_tokens] * batch_size
-        return draft_token_ids[:batch_size, : self.num_speculative_tokens].to(
-            torch.int32
+
+        result = self._timed_stage("postprocess", postprocess)
+        self._record_stage_timing(
+            "total",
+            (time.perf_counter() - total_started) * 1000.0,
         )
+        self._maybe_log_stage_timing()
+        return result
 
     def get_diagnostics_snapshot(self) -> Any:
         return self.diagnostics.snapshot()
