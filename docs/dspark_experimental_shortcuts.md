@@ -100,6 +100,11 @@ production branch.
   local tokenizer counts with Prometheus counter deltas. Final throughput
   comparisons should prefer internal engine timing or server-side generation
   token counters over retokenized response text.
+- Speculative decode metrics now export
+  `vllm:spec_decode_num_drafts_by_draft_length_total`, and the DSpark runtime
+  overlay copies `vllm/v1/spec_decode/metrics.py` into the packaged image. Keep
+  this generic metric in place; it is the direct signal for whether dynamic
+  prefix scheduling is actually pruning verification length.
 - The DSpark experiment currently relies on the existing FlashInfer sparse MLA
   autotune cache. Startup warned that some decode capture shapes fall outside
   the tuned bucket range and fall back to tactic `-1`; add those DSpark shapes to
@@ -169,6 +174,11 @@ production branch.
   profiled local SPS curve now that ragged mixed batches can preserve request
   row identity. Compare c=4/c=8 per-user and aggregate tok/s against the
   compact-ragged checkpoint before treating scheduler work as a win.
+- TODO P0: reprofile the hardware scheduler in a regime where it can actually
+  choose shorter prefixes. The first c=4/c=8 curve mostly scheduled full
+  length (`{4: 1, 5: 121}` in a c=4 smoke), c=4 was flat, and c=8 regressed
+  versus scheduler-off controls. Fill the B=24..48 SPS gap with c=8 forced
+  lengths and test c=16 / `MAX_NUM_SEQS=16` before changing the policy.
 - TODO P1: add warmup coverage for inference-time JIT gaps observed on the real
   server: request-prep metadata, route packing, EAGLE-named speculative prep,
   and rejection greedy sampling.
@@ -195,6 +205,11 @@ production branch.
   confidence aggregation across the fixed five-token DSpark block.
 - TODO P3: move confidence diagnostics and prefix-pruning decisions to a
   GPU-side/asynchronous metrics path.
+- TODO P3: port the derived 1M context padded `nvfp4_ds_mla` path as source
+  changes rather than Dockerfile text patches. Keep it as a separate launch
+  profile from the current 262k fp8 DSpark scheduler work, and validate with
+  `/v1/models` max length, KV-pool logs, short decode probes, and later a real
+  long-context retrieval/correctness prompt.
 
 - Implemented first pass: replace `DeepSeekV4DSparkAttention`'s PyTorch
   sparse-attention loop with a graph-safe native kernel for the serving decode

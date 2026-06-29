@@ -24,7 +24,8 @@ does **not** affect the image unless you add it to the Dockerfile's `COPY` list)
 `vllm/v1/outputs.py`, `vllm/v1/core/sched/scheduler.py`,
 `vllm/models/deepseek_v4/{__init__,nvidia/model,nvidia/sm120,nvidia/dspark,nvidia/dspark_kernels}.py`,
 `vllm/v1/attention/backends/registry.py`, `vllm/v1/attention/backends/mla/b12x_mla_sparse.py`,
-`vllm/v1/spec_decode/{dspark,dspark_proposer}.py`, `vllm/v1/worker/gpu_model_runner.py`.
+`vllm/v1/spec_decode/{dspark,dspark_proposer,metrics}.py`,
+`vllm/v1/worker/gpu_model_runner.py`.
 
 ## Prerequisites (per node)
 

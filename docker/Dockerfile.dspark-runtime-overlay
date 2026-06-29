@@ -23,6 +23,7 @@ COPY vllm/v1/attention/backends/registry.py /opt/env/lib/python3.12/site-package
 COPY vllm/v1/attention/backends/mla/b12x_mla_sparse.py /opt/env/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
 COPY vllm/v1/spec_decode/dspark.py /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py
 COPY vllm/v1/spec_decode/dspark_proposer.py /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark_proposer.py
+COPY vllm/v1/spec_decode/metrics.py /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/metrics.py
 COPY vllm/v1/worker/gpu_model_runner.py /opt/env/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py
 
 RUN /opt/env/bin/python -m py_compile \
@@ -36,4 +37,5 @@ RUN /opt/env/bin/python -m py_compile \
     /opt/env/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/b12x_mla_sparse.py \
     /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py \
     /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark_proposer.py \
+    /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/metrics.py \
     /opt/env/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py
