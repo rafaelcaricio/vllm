@@ -109,6 +109,9 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self._confidence_diagnostics_log_next = (
             self._confidence_diagnostics_log_every
         )
+        self._collect_sts_calibration_diagnostics = (
+            self._read_sts_calibration_diagnostics()
+        )
         self._collect_position0_diagnostics = (
             self._read_position0_diagnostics()
         )
@@ -121,6 +124,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self._stage_timing_count = 0
         self._stage_timing_totals_ms: dict[str, float] = {}
         self._last_confidence: torch.Tensor | None = None
+        self._last_raw_confidence: torch.Tensor | None = None
         if self.confidence_threshold > 0.0:
             logger.info(
                 "DSpark confidence-scheduled verification enabled with "
@@ -169,6 +173,12 @@ class DSparkProposer(SpecDecodeBaseProposer):
                 "DSpark position-0 diagnostics enabled. The confidence head "
                 "runs on every draft step; the runner logs first-token "
                 "target-argmax agreement."
+            )
+        if self._collect_sts_calibration_diagnostics:
+            logger.info(
+                "DSpark STS calibration diagnostics enabled. Raw confidence "
+                "rows are copied to CPU and paired with acceptance labels for "
+                "offline temperature fitting."
             )
         if self._gpu_rejected_context_mask:
             logger.info(
@@ -377,6 +387,11 @@ class DSparkProposer(SpecDecodeBaseProposer):
     @staticmethod
     def _read_position0_diagnostics() -> bool:
         raw = os.getenv("VLLM_DSPARK_POSITION0_DIAGNOSTICS", "0")
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _read_sts_calibration_diagnostics() -> bool:
+        raw = os.getenv("VLLM_DSPARK_STS_CALIBRATION_DIAGNOSTICS", "0")
         return raw.strip().lower() in {"1", "true", "yes", "on"}
 
     @staticmethod
@@ -1116,6 +1131,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
         return (
             self._should_observe_confidence()
             or getattr(self, "_collect_position0_diagnostics", False)
+            or getattr(self, "_collect_sts_calibration_diagnostics", False)
         )
 
     def _needs_draft_logits(self) -> bool:
@@ -1134,6 +1150,11 @@ class DSparkProposer(SpecDecodeBaseProposer):
     def take_last_confidence(self) -> torch.Tensor | None:
         confidence = self._last_confidence
         self._last_confidence = None
+        return confidence
+
+    def take_last_raw_confidence(self) -> torch.Tensor | None:
+        confidence = self._last_raw_confidence
+        self._last_raw_confidence = None
         return confidence
 
     def _maybe_store_draft_probs(
@@ -1187,6 +1208,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
         )
         self._last_draft_probs = None
         self._last_confidence = None
+        self._last_raw_confidence = None
         total_started = time.perf_counter()
         batch_size = self._batch_size(next_token_ids)
 
@@ -1283,6 +1305,10 @@ class DSparkProposer(SpecDecodeBaseProposer):
                 confidence_for_batch = self._calibrate_confidence(
                     raw_confidence_for_batch
                 )
+                if getattr(self, "_collect_sts_calibration_diagnostics", False):
+                    self._last_raw_confidence = (
+                        raw_confidence_for_batch.detach().clone()
+                    )
                 if getattr(self, "_collect_position0_diagnostics", False):
                     self._last_confidence = confidence_for_batch.detach().clone()
             forced_length = getattr(self, "_forced_draft_length", None)

@@ -438,12 +438,15 @@ class GPUModelRunner(
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
-        self._dspark_iter_timing = os.getenv("VLLM_DSPARK_ITER_TIMING", "0").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        self._dspark_iter_timing = (
+            os.getenv("VLLM_DSPARK_ITER_TIMING", "0").lower()
+            in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        )
         try:
             self._dspark_iter_timing_log_every = max(
                 1, int(os.getenv("VLLM_DSPARK_ITER_TIMING_LOG_EVERY", "20"))
@@ -858,6 +861,8 @@ class GPUModelRunner(
         self._draft_prob_req_ids: list[str] | None = None
         self._draft_confidence: torch.Tensor | None = None
         self._draft_confidence_req_ids: list[str] | None = None
+        self._draft_raw_confidence: torch.Tensor | None = None
+        self._draft_raw_confidence_req_ids: list[str] | None = None
         self._dspark_position0_diagnostics = (
             DSparkPosition0Diagnostics()
             if (
@@ -873,6 +878,16 @@ class GPUModelRunner(
                 "DSpark position-0 quality diagnostics enabled. This copies "
                 "one scalar agreement and optional confidence per request to "
                 "CPU on speculative decode steps."
+            )
+        self._dspark_sts_calibration_diagnostics = (
+            self.speculative_config is not None
+            and self.speculative_config.use_dspark()
+            and envs.VLLM_DSPARK_STS_CALIBRATION_DIAGNOSTICS
+        )
+        if self._dspark_sts_calibration_diagnostics:
+            logger.info(
+                "DSpark STS calibration diagnostics enabled. Raw confidence "
+                "rows are copied to CPU and paired with accepted-token labels."
             )
         # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
         self._num_valid_draft_tokens: torch.Tensor | None = None
@@ -3650,6 +3665,40 @@ class GPUModelRunner(
         )
         self._dspark_position0_log_next = snapshot.num_tokens + 64
 
+    def _make_dspark_sts_calibration_confidence(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> dict[str, tuple[float, ...]] | None:
+        if not self._dspark_sts_calibration_diagnostics:
+            return None
+        if (
+            self._draft_raw_confidence is None
+            or self._draft_raw_confidence_req_ids is None
+            or not scheduler_output.scheduled_spec_decode_tokens
+        ):
+            return None
+
+        row_by_req_id = {
+            req_id: row
+            for row, req_id in enumerate(self._draft_raw_confidence_req_ids)
+        }
+        confidence_cpu = self._draft_raw_confidence.detach().float().cpu()
+        confidence_by_req_id: dict[str, tuple[float, ...]] = {}
+        for (
+            req_id,
+            draft_tokens,
+        ) in scheduler_output.scheduled_spec_decode_tokens.items():
+            row = row_by_req_id.get(req_id)
+            if row is None:
+                continue
+            draft_len = min(len(draft_tokens), confidence_cpu.shape[1])
+            if draft_len <= 0:
+                continue
+            confidence_by_req_id[req_id] = tuple(
+                float(value) for value in confidence_cpu[row, :draft_len].tolist()
+            )
+        return confidence_by_req_id or None
+
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4564,6 +4613,9 @@ class GPUModelRunner(
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
+        dspark_confidence = self._make_dspark_sts_calibration_confidence(
+            scheduler_output
+        )
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
@@ -4582,6 +4634,8 @@ class GPUModelRunner(
         self._draft_prob_req_ids = None
         self._draft_confidence = None
         self._draft_confidence_req_ids = None
+        self._draft_raw_confidence = None
+        self._draft_raw_confidence_req_ids = None
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
@@ -4684,6 +4738,8 @@ class GPUModelRunner(
                 self._draft_prob_req_ids = None
                 self._draft_confidence = None
                 self._draft_confidence_req_ids = None
+                self._draft_raw_confidence = None
+                self._draft_raw_confidence_req_ids = None
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
         stage_started = self._dspark_timing_start()
@@ -4753,6 +4809,7 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
                 draft_token_lengths=draft_token_lengths,
+                dspark_confidence=dspark_confidence,
             )
         self._dspark_timing_record("finalize_output", stage_started)
 
@@ -5269,6 +5326,13 @@ class GPUModelRunner(
                 if confidence is not None:
                     self._draft_confidence = confidence
                     self._draft_confidence_req_ids = (
+                        self.input_batch.req_ids.copy()
+                    )
+            if hasattr(self.drafter, "take_last_raw_confidence"):
+                raw_confidence = self.drafter.take_last_raw_confidence()
+                if raw_confidence is not None:
+                    self._draft_raw_confidence = raw_confidence
+                    self._draft_raw_confidence_req_ids = (
                         self.input_batch.req_ids.copy()
                     )
             if spec_config.use_dspark() and hasattr(

@@ -284,6 +284,11 @@ class ModelRunnerOutput:
     # before real draft token ids are available on CPU.
     draft_token_lengths: dict[str, int] | None = None
 
+    # Optional DSpark raw confidence rows for the draft verified in this
+    # scheduler step. Diagnostic-only: used to fit STS temperatures from
+    # confidence-vs-acceptance bins.
+    dspark_confidence: dict[str, tuple[float, ...]] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

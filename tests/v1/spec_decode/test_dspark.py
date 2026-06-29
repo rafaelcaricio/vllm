@@ -1959,6 +1959,25 @@ def test_dspark_proposer_reads_confidence_diagnostics_log_every(
         DSparkProposer._read_confidence_diagnostics_log_every()
 
 
+def test_dspark_proposer_sts_calibration_diagnostics_requires_env(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("VLLM_DSPARK_STS_CALIBRATION_DIAGNOSTICS", raising=False)
+    assert not DSparkProposer._read_sts_calibration_diagnostics()
+
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.confidence_threshold = 0.0
+    proposer.confidence_scheduler = "off"
+    proposer._collect_position0_diagnostics = False
+    proposer._collect_sts_calibration_diagnostics = False
+    assert not DSparkProposer._needs_confidence(proposer)
+
+    monkeypatch.setenv("VLLM_DSPARK_STS_CALIBRATION_DIAGNOSTICS", "1")
+    assert DSparkProposer._read_sts_calibration_diagnostics()
+    proposer._collect_sts_calibration_diagnostics = True
+    assert DSparkProposer._needs_confidence(proposer)
+
+
 def test_dspark_proposer_logs_confidence_diagnostics(monkeypatch) -> None:
     proposer = DSparkProposer.__new__(DSparkProposer)
     proposer.num_speculative_tokens = 2

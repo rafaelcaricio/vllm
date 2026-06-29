@@ -194,6 +194,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_STAGE_TIMING: bool = False
     VLLM_DSPARK_STAGE_TIMING_LOG_EVERY: int = 20
     VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY: int = 0
+    VLLM_DSPARK_STS_CALIBRATION_DIAGNOSTICS: bool = False
     VLLM_DSPARK_ITER_TIMING: bool = False
     VLLM_DSPARK_ITER_TIMING_LOG_EVERY: int = 20
     VLLM_DSPARK_TARGET_TIMING: bool = False
@@ -1510,6 +1511,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY": lambda: int(
         os.getenv("VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY", "0")
+    ),
+    "VLLM_DSPARK_STS_CALIBRATION_DIAGNOSTICS": lambda: (
+        os.getenv("VLLM_DSPARK_STS_CALIBRATION_DIAGNOSTICS", "0").strip().lower()
+        in ("1", "true", "yes", "on")
     ),
     "VLLM_DSPARK_POSITION0_DIAGNOSTICS": lambda: (
         os.getenv("VLLM_DSPARK_POSITION0_DIAGNOSTICS", "0").strip().lower()

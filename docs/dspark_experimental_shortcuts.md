@@ -71,6 +71,12 @@ production branch.
   path before production benchmarking. Use
   `VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY` for dedicated calibration
   runs; keep it `0` during throughput gates.
+- `VLLM_DSPARK_STS_CALIBRATION_DIAGNOSTICS=1` adds an opt-in calibration-label
+  stream for fitting STS temperatures from real acceptance outcomes. It copies
+  only the current verified draft's raw confidence row, then collapses samples
+  into fixed-size per-position confidence-bin counters before logging. Keep it
+  disabled for throughput gates; do not add per-request or per-step Python
+  history here because long server runs must stay memory bounded.
 - Draft probabilities are not returned for probabilistic rejection sampling.
   The current path targets greedy single-stream benchmarking first.
 - Confidence scheduling consumes sigmoided probabilities today. The paper's STS
@@ -180,6 +186,11 @@ production branch.
   against the real model and record tok/s, scheduled length, prune rate,
   accepted tokens, and acceptance by position. Compare static thresholding with
   the paper's hardware-aware scheduler before promoting a default.
+- TODO P0: run an STS calibration diagnostic pass with
+  `VLLM_DSPARK_STS_CALIBRATION_DIAGNOSTICS=1`,
+  `VLLM_DSPARK_STS_TEMPERATURES=` empty, and scheduler decisions otherwise
+  unchanged. Fit per-position temperatures from the logged confidence-bin
+  acceptance labels before enabling STS in speed gates.
 - TODO P0: use the threshold sweep as the next speed gate. Test thresholds such
   as `0.20`, `0.35`, and `0.50` with three post-JIT salted repetitions each;
   keep only changes that materially beat the 37.64 tokens/s fixed-length
