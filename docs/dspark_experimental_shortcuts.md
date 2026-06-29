@@ -86,6 +86,18 @@ production branch.
   per-request lengths. A 3x 1024-token real-model run measured `61.64 +/- 1.86`
   tok/s versus the `62.08 +/- 0.70` scheduler-off baseline, so this removes
   unnecessary CPU plumbing but does not explain the remaining decode bottleneck.
+- 2026-06-29 `VLLM_DSPARK_FUSED_MARKOV_ARGMAX=1` was A/B tested with 3x
+  1024-token real-model single-stream runs. It measured `61.75 +/- 3.52`
+  tok/s versus the `62.08 +/- 0.70` scheduler-off baseline. The fused local
+  Markov argmax avoids materializing local Markov logits, but it still needs the
+  per-position TP top-1 reduction because the base LM-head logits remain
+  vocab-sharded.
+- The DeepSpec reference Markov head uses a full-vocab `W2`, but in this TP=2
+  vLLM integration the draft base logits come from the target model's
+  vocab-parallel `lm_head`. Replicating only Markov `W2` does not remove the
+  global argmax communication. A paper-faithful no-TP-reduce draft-output path
+  would need a draft-local replicated output head, a specialized low-latency
+  GPU reduction, or another way for each rank to see full corrected logits.
 - `VLLM_DSPARK_STS_CALIBRATION_DIAGNOSTICS=1` adds an opt-in calibration-label
   stream for fitting STS temperatures from real acceptance outcomes. It copies
   only the current verified draft's raw confidence row, then collapses samples
@@ -197,6 +209,16 @@ production branch.
   can separate target verification time, `prefill_main`/main-KV update time,
   draft sparse attention/projection time, Markov/logit selection time, and
   rejection sampling time.
+- TODO P0: profile the TP top-1 reduction inside the DSpark Markov loop. There
+  are five sequential per-position reductions in the default `gamma=5` path.
+  Because base logits are sharded, a `markov_w2` replication-only shortcut is
+  insufficient; compare a draft-local replicated output-head prototype against
+  a custom low-latency pair-reduction path before promoting either direction.
+- TODO P0: validate opt-in FlashInfer allreduce on SM121/world_size=2 with an
+  explicit `VLLM_FLASHINFER_ALLREDUCE_FUSION_THRESHOLDS_MB` override. The
+  upstream default table has no tuned GB10 entry, so keep this off by default
+  until startup logs prove the backend is active and repeated benchmarks show a
+  decode-speed gain.
 - TODO P0: run a threshold sweep over `VLLM_DSPARK_CONFIDENCE_THRESHOLD`
   against the real model and record tok/s, scheduled length, prune rate,
   accepted tokens, and acceptance by position. Compare static thresholding with

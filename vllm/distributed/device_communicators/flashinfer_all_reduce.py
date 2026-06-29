@@ -212,6 +212,15 @@ def get_fi_ar_quant_workspace(
 _fi_ar_workspace_lock = threading.Lock()
 
 
+def _configured_max_workspace_size_mb(world_size: int) -> float | None:
+    thresholds = envs.VLLM_FLASHINFER_ALLREDUCE_FUSION_THRESHOLDS_MB
+    for key in (world_size, str(world_size)):
+        if key in thresholds:
+            value = thresholds[key]
+            return None if value is None else float(value)
+    return PassConfig.default_fi_allreduce_fusion_max_size_mb().get(world_size)
+
+
 def destroy_fi_ar_workspace():
     global _fi_ar_workspace, _fi_ar_quant_workspace
     with _fi_ar_workspace_lock:
@@ -258,13 +267,13 @@ class FlashInferAllReduce:
         # Use the same threshold as the allreduce-rms fusion pass
         # TODO: tune the threshold
         MiB = 1024 * 1024
-        max_workspace_size = PassConfig.default_fi_allreduce_fusion_max_size_mb().get(
-            self.world_size, None
-        )
+        max_workspace_size = _configured_max_workspace_size_mb(self.world_size)
         if not max_workspace_size:
             logger.warning(
                 "FlashInfer All Reduce is disabled because it "
-                "is not supported for world_size=%d.",
+                "is not supported for world_size=%d and no explicit "
+                "VLLM_FLASHINFER_ALLREDUCE_FUSION_THRESHOLDS_MB override "
+                "was provided.",
                 self.world_size,
             )
             return
