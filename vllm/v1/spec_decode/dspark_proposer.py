@@ -1062,13 +1062,19 @@ class DSparkProposer(SpecDecodeBaseProposer):
         return prefill_batches, last_hidden, last_positions
 
     def _warmup_drafts(self, batch_size: int) -> torch.Tensor:
-        self._last_draft_lengths = [self.num_speculative_tokens] * batch_size
+        self._last_draft_lengths = None
         return make_dspark_warmup_draft_token_ids(
             batch_size=batch_size,
             num_speculative_tokens=self.num_speculative_tokens,
             noise_token_id=self.noise_token_id,
             device=self.device,
         )
+
+    def _set_last_draft_lengths(self, lengths: list[int]) -> None:
+        if all(int(length) == self.num_speculative_tokens for length in lengths):
+            self._last_draft_lengths = None
+            return
+        self._last_draft_lengths = [int(length) for length in lengths]
 
     def _calibrate_confidence(self, confidence: torch.Tensor) -> torch.Tensor:
         temperatures = getattr(self, "_sts_temperatures", ())
@@ -1359,17 +1365,19 @@ class DSparkProposer(SpecDecodeBaseProposer):
                     self._last_confidence = confidence_for_batch.detach().clone()
             forced_length = getattr(self, "_forced_draft_length", None)
             if forced_length is not None:
-                self._last_draft_lengths = [int(forced_length)] * batch_size
+                self._set_last_draft_lengths([int(forced_length)] * batch_size)
             elif (
                 confidence_for_batch is not None
                 and self._should_observe_confidence()
             ):
-                self._last_draft_lengths = self._observe_confidence(
-                    confidence_for_batch,
-                    raw_confidence=raw_confidence_for_batch,
+                self._set_last_draft_lengths(
+                    self._observe_confidence(
+                        confidence_for_batch,
+                        raw_confidence=raw_confidence_for_batch,
+                    )
                 )
             else:
-                self._last_draft_lengths = [self.num_speculative_tokens] * batch_size
+                self._last_draft_lengths = None
             return draft_token_ids[:batch_size, : self.num_speculative_tokens].to(
                 torch.int32
             )

@@ -79,6 +79,13 @@ production branch.
   baseline behavior (`61.75` tok/s mean vs `62.08` scheduler-off baseline);
   it is overhead hygiene, not a new speed lever. Keep pushing hot prefix
   decisions toward GPU-side reductions instead of expanding CPU policy.
+- 2026-06-29 full-prefix draft lengths no longer cross the async scheduler
+  bridge as a Python list. DSpark now returns `None` for draft lengths when
+  every request uses the configured full prefix, leaving vLLM's normal fixed
+  speculative placeholder path intact. Only shortened prefixes return explicit
+  per-request lengths. A 3x 1024-token real-model run measured `61.64 +/- 1.86`
+  tok/s versus the `62.08 +/- 0.70` scheduler-off baseline, so this removes
+  unnecessary CPU plumbing but does not explain the remaining decode bottleneck.
 - `VLLM_DSPARK_STS_CALIBRATION_DIAGNOSTICS=1` adds an opt-in calibration-label
   stream for fitting STS temperatures from real acceptance outcomes. It copies
   only the current verified draft's raw confidence row, then collapses samples

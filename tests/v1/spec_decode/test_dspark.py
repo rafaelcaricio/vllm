@@ -956,7 +956,7 @@ def test_dspark_proposer_skips_confidence_observation_when_threshold_off(
     )
 
     assert draft_ids.tolist() == [[7, 7, 7, 7, 7]]
-    assert DSparkProposer.take_last_draft_lengths(proposer) == [5]
+    assert DSparkProposer.take_last_draft_lengths(proposer) is None
     assert proposer._last_confidence is not None
     torch.testing.assert_close(proposer._last_confidence, model_confidence)
     assert proposer._last_confidence.data_ptr() != model_confidence.data_ptr()
@@ -1106,6 +1106,24 @@ def test_dspark_forced_draft_length_skips_scheduler_confidence() -> None:
 
     assert not DSparkProposer._should_observe_confidence(proposer)
     assert not DSparkProposer._needs_confidence(proposer)
+
+
+def test_dspark_default_draft_length_does_not_cross_scheduler_bridge() -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.num_speculative_tokens = 5
+
+    DSparkProposer._set_last_draft_lengths(proposer, [5, 5])
+
+    assert DSparkProposer.take_last_draft_lengths(proposer) is None
+
+
+def test_dspark_short_draft_length_crosses_scheduler_bridge() -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.num_speculative_tokens = 5
+
+    DSparkProposer._set_last_draft_lengths(proposer, [5, 3])
+
+    assert DSparkProposer.take_last_draft_lengths(proposer) == [5, 3]
 
 
 def test_dspark_proposer_exposes_position0_confidence() -> None:
@@ -1612,7 +1630,7 @@ def test_dspark_proposer_gpu_mask_anchors_on_last_non_rejected_token(
     torch.testing.assert_close(draft_hidden, hidden[1:2])
     torch.testing.assert_close(draft_positions, torch.tensor([11]))
     assert draft_ids.tolist() == [[7, 7, 7, 7, 7]]
-    assert DSparkProposer.take_last_draft_lengths(proposer) == [5]
+    assert DSparkProposer.take_last_draft_lengths(proposer) is None
 
 
 def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
@@ -1764,7 +1782,7 @@ def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
         [9, 9, 9, 9, 9],
         [9, 9, 9, 9, 9],
     ]
-    assert DSparkProposer.take_last_draft_lengths(proposer) == [5, 5, 5]
+    assert DSparkProposer.take_last_draft_lengths(proposer) is None
 
 
 def test_dspark_attention_store_main_kv_can_skip_fully_masked_rows() -> None:
