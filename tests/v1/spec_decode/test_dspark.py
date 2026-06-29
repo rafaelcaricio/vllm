@@ -18,6 +18,7 @@ from vllm.v1.spec_decode.dspark import (
     DSparkPosition0Diagnostics,
     confidence_threshold_prefix_length,
     cumulative_survival,
+    full_prefix_dominates_sps_curve,
     hardware_aware_prefix_schedule,
     infer_dspark_num_draft_layers,
     infer_dspark_weight_prefix,
@@ -141,6 +142,40 @@ def _brute_force_prefix_schedule(
             best = result
     assert best is not None
     return best
+
+
+def test_full_prefix_dominates_sps_curve_for_single_stream_profile() -> None:
+    curve = {
+        1: 0.038045,
+        2: 9.840034,
+        3: 10.400448,
+        4: 10.796546,
+        5: 10.508421,
+        6: 14.244464,
+    }
+
+    assert full_prefix_dominates_sps_curve(
+        request_count=1,
+        max_spec_tokens=5,
+        steps_per_second=lambda batch_tokens: curve[batch_tokens],
+    )
+
+
+def test_full_prefix_dominates_sps_curve_rejects_concurrency_profile() -> None:
+    def steps_per_second(batch_tokens: int) -> float:
+        if batch_tokens < 12:
+            return 7.235357
+        if batch_tokens < 16:
+            return 7.749286
+        if batch_tokens < 48:
+            return 6.334372
+        return 5.396963
+
+    assert not full_prefix_dominates_sps_curve(
+        request_count=8,
+        max_spec_tokens=5,
+        steps_per_second=steps_per_second,
+    )
 
 
 def test_dspark_model_spec_matches_deepseek_v4_flash_release_fields() -> None:
@@ -1006,6 +1041,71 @@ def test_dspark_proposer_requests_only_needed_draft_outputs(
         if expected_return_confidence
         else confidence.numel() == 0
     )
+
+
+def test_dspark_hardware_scheduler_skips_confidence_when_full_prefix_dominates() -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.num_speculative_tokens = 5
+    proposer.confidence_scheduler = "hardware"
+    proposer.confidence_threshold = 0.0
+    proposer._forced_draft_length = None
+    proposer._collect_confidence_diagnostics = False
+    proposer._collect_position0_diagnostics = False
+    proposer._collect_sts_calibration_diagnostics = False
+    proposer._draft_active_batch_size = 1
+    proposer._sps_curve = (
+        (1, 0.038045),
+        (2, 9.840034),
+        (3, 10.400448),
+        (4, 10.796546),
+        (5, 10.508421),
+        (6, 14.244464),
+    )
+
+    assert not DSparkProposer._should_observe_confidence(proposer)
+    assert not DSparkProposer._needs_confidence(proposer)
+
+
+def test_dspark_hardware_scheduler_keeps_confidence_when_shorter_width_can_win() -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.num_speculative_tokens = 5
+    proposer.confidence_scheduler = "hardware"
+    proposer.confidence_threshold = 0.0
+    proposer._forced_draft_length = None
+    proposer._collect_confidence_diagnostics = False
+    proposer._collect_position0_diagnostics = False
+    proposer._collect_sts_calibration_diagnostics = False
+    proposer._draft_active_batch_size = 8
+    proposer._sps_curve = (
+        (8, 7.235357),
+        (12, 7.749286),
+        (16, 6.334372),
+        (48, 5.396963),
+    )
+
+    assert DSparkProposer._should_observe_confidence(proposer)
+    assert DSparkProposer._needs_confidence(proposer)
+
+
+def test_dspark_forced_draft_length_skips_scheduler_confidence() -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.num_speculative_tokens = 5
+    proposer.confidence_scheduler = "hardware"
+    proposer.confidence_threshold = 0.0
+    proposer._forced_draft_length = 3
+    proposer._collect_confidence_diagnostics = False
+    proposer._collect_position0_diagnostics = False
+    proposer._collect_sts_calibration_diagnostics = False
+    proposer._draft_active_batch_size = 8
+    proposer._sps_curve = (
+        (8, 7.235357),
+        (12, 7.749286),
+        (16, 6.334372),
+        (48, 5.396963),
+    )
+
+    assert not DSparkProposer._should_observe_confidence(proposer)
+    assert not DSparkProposer._needs_confidence(proposer)
 
 
 def test_dspark_proposer_exposes_position0_confidence() -> None:

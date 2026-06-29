@@ -655,6 +655,42 @@ def score_prefix_lengths(
     )
 
 
+def full_prefix_dominates_sps_curve(
+    *,
+    request_count: int,
+    max_spec_tokens: int,
+    steps_per_second: StepCurve,
+) -> bool:
+    """Return whether full-prefix verification is always optimal.
+
+    Expected accepted tokens are monotonic in scheduled prefix length. If the
+    profiled engine step rate at the full DSpark width is at least as high as
+    every shorter width, no confidence observation can make a shorter prefix
+    win. In that hardware regime the paper's scheduler degenerates to verifying
+    the whole draft block.
+    """
+
+    request_count = int(request_count)
+    max_spec_tokens = int(max_spec_tokens)
+    if request_count <= 0:
+        raise ValueError(f"request_count must be positive, got {request_count}")
+    if max_spec_tokens <= 0:
+        raise ValueError(f"max_spec_tokens must be positive, got {max_spec_tokens}")
+
+    full_batch_tokens = request_count * (1 + max_spec_tokens)
+    full_rate = float(steps_per_second(full_batch_tokens))
+    if full_rate < 0.0:
+        raise ValueError("steps_per_second must return a non-negative value")
+
+    for batch_tokens in range(request_count, full_batch_tokens):
+        rate = float(steps_per_second(batch_tokens))
+        if rate < 0.0:
+            raise ValueError("steps_per_second must return a non-negative value")
+        if rate > full_rate:
+            return False
+    return True
+
+
 def hardware_aware_prefix_schedule(
     confidence_rows: Sequence[Sequence[float]],
     *,

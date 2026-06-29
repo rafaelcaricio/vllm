@@ -71,6 +71,14 @@ production branch.
   path before production benchmarking. Use
   `VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY` for dedicated calibration
   runs; keep it `0` during throughput gates.
+- 2026-06-29 single-stream SPS-dominance guard: when
+  `VLLM_DSPARK_CONFIDENCE_SCHEDULER=hardware` is enabled but the profiled local
+  SPS curve is dominated by the full DSpark prefix, the proposer now skips the
+  confidence head and CPU scheduler path and verifies the full prefix. Real
+  1024-token A/B showed this correctly logged on both ranks and returned to
+  baseline behavior (`61.75` tok/s mean vs `62.08` scheduler-off baseline);
+  it is overhead hygiene, not a new speed lever. Keep pushing hot prefix
+  decisions toward GPU-side reductions instead of expanding CPU policy.
 - `VLLM_DSPARK_STS_CALIBRATION_DIAGNOSTICS=1` adds an opt-in calibration-label
   stream for fitting STS temperatures from real acceptance outcomes. It copies
   only the current verified draft's raw confidence row, then collapses samples

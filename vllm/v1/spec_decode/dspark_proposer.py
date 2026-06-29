@@ -20,6 +20,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.dspark import (
     DSparkDiagnostics,
     confidence_threshold_prefix_length,
+    full_prefix_dominates_sps_curve,
     hardware_aware_prefix_schedule,
     make_dspark_warmup_draft_token_ids,
     score_prefix_lengths,
@@ -60,6 +61,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self._runner = runner
         self._draft_graph_runner: CUDAGraphWrapper | None = None
         self._draft_graph_batch_size = 0
+        self._draft_active_batch_size = 0
         self._draft_input_ids_buffer = torch.zeros(
             self.max_batch_size,
             dtype=torch.long,
@@ -115,6 +117,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self._collect_position0_diagnostics = (
             self._read_position0_diagnostics()
         )
+        self._logged_scheduler_confidence_bypass = False
         self._gpu_rejected_context_mask = (
             self._read_gpu_rejected_context_mask()
         )
@@ -356,6 +359,48 @@ class DSparkProposer(SpecDecodeBaseProposer):
             return scheduler
         threshold = getattr(self, "confidence_threshold", 0.0)
         return "threshold" if threshold > 0.0 else "off"
+
+    def _confidence_request_count(self) -> int | None:
+        active_batch_size = int(getattr(self, "_draft_active_batch_size", 0) or 0)
+        if active_batch_size > 0:
+            return active_batch_size
+        graph_batch_size = int(getattr(self, "_draft_graph_batch_size", 0) or 0)
+        if graph_batch_size > 0:
+            return graph_batch_size
+        return None
+
+    def _hardware_scheduler_full_prefix_dominates(self) -> bool:
+        request_count = self._confidence_request_count()
+        if request_count is None:
+            return False
+        return full_prefix_dominates_sps_curve(
+            request_count=request_count,
+            max_spec_tokens=self.num_speculative_tokens,
+            steps_per_second=self._steps_per_second,
+        )
+
+    def _scheduler_requires_confidence(self) -> bool:
+        if getattr(self, "_forced_draft_length", None) is not None:
+            return False
+
+        scheduler = self._effective_confidence_scheduler()
+        if scheduler == "off":
+            return False
+        if scheduler == "threshold":
+            return self.confidence_threshold > 0.0
+        if scheduler == "hardware":
+            if self._hardware_scheduler_full_prefix_dominates():
+                if not getattr(self, "_logged_scheduler_confidence_bypass", False):
+                    logger.info(
+                        "DSpark hardware scheduler bypassing confidence head: "
+                        "full prefix dominates the profiled SPS curve for "
+                        "request_count=%d.",
+                        self._confidence_request_count(),
+                    )
+                    self._logged_scheduler_confidence_bypass = True
+                return False
+            return True
+        return True
 
     @staticmethod
     def _read_export_draft_probs() -> bool:
@@ -623,6 +668,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
         padded_batch_size: int,
     ) -> None:
         batch_size = input_ids.shape[0]
+        self._draft_active_batch_size = batch_size
         self._draft_graph_batch_size = padded_batch_size
         self._draft_input_ids_buffer[:batch_size].copy_(input_ids.to(torch.long))
         self._draft_hidden_buffer[:batch_size].copy_(hidden_states.to(self.dtype))
@@ -1123,7 +1169,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
 
     def _should_observe_confidence(self) -> bool:
         return (
-            self._effective_confidence_scheduler() != "off"
+            self._scheduler_requires_confidence()
             or getattr(self, "_collect_confidence_diagnostics", False)
         )
 

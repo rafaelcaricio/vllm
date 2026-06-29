@@ -197,6 +197,19 @@ def _dspark_warmup_request_counts(worker: "Worker") -> tuple[int, ...]:
     return tuple(sorted({1, min(max_num_seqs, 4)}))
 
 
+def _dspark_store_main_kv_warmup_seq_lens(worker: "Worker") -> tuple[int, ...]:
+    query_len = _dspark_spec_decode_query_len(worker)
+    if query_len is None:
+        return ()
+
+    hf_config = _deepseek_v4_hf_config(worker)
+    sliding_window = int(getattr(hf_config, "sliding_window", 0) or 0)
+    seq_lens = set(range(1, query_len + 1))
+    if sliding_window > 0:
+        seq_lens.add(sliding_window)
+    return tuple(sorted(seq_lens))
+
+
 @torch.inference_mode()
 def _deepseek_v4_b12x_route_pack_warmup(worker: "Worker") -> None:
     """Pre-JIT B12X/FlashInfer W4A16 MoE route-packing kernels.
@@ -406,8 +419,8 @@ def _deepseek_v4_rejection_sampler_warmup(worker: "Worker") -> None:
 @torch.inference_mode()
 def _deepseek_v4_dspark_store_main_kv_warmup(worker: "Worker") -> None:
     """Pre-JIT DSpark direct main-KV store flag combinations."""
-    query_len = _dspark_spec_decode_query_len(worker)
-    if query_len is None:
+    seq_lens = _dspark_store_main_kv_warmup_seq_lens(worker)
+    if not seq_lens:
         return
 
     hf_config = _deepseek_v4_hf_config(worker)
@@ -426,54 +439,55 @@ def _deepseek_v4_dspark_store_main_kv_warmup(worker: "Worker") -> None:
     device = worker.model_runner.device
     dtype = worker.model_runner.dtype
     sliding_window = int(getattr(hf_config, "sliding_window", 0) or 0)
-    window_size = max(query_len, min(sliding_window, 16))
+    window_size = max(max(seq_lens), sliding_window, 1)
     for batch_size in _dspark_warmup_request_counts(worker):
-        main_kv_cache = torch.empty(
-            batch_size,
-            window_size,
-            head_dim,
-            dtype=dtype,
-            device=device,
-        )
-        flat_kv = torch.empty(
-            batch_size,
-            query_len,
-            head_dim,
-            dtype=dtype,
-            device=device,
-        )
-        slots = (
-            torch.arange(query_len, dtype=torch.long, device=device)
-            .view(1, query_len)
-            .expand(batch_size, query_len)
-            .remainder(window_size)
-            .contiguous()
-        )
-        rejected = torch.zeros(batch_size, dtype=torch.int32, device=device)
-        if batch_size > 1:
-            rejected[-1] = 1
-        request_indices = torch.arange(batch_size, dtype=torch.long, device=device)
+        for seq_len in seq_lens:
+            main_kv_cache = torch.empty(
+                batch_size,
+                window_size,
+                head_dim,
+                dtype=dtype,
+                device=device,
+            )
+            flat_kv = torch.empty(
+                batch_size,
+                seq_len,
+                head_dim,
+                dtype=dtype,
+                device=device,
+            )
+            slots = (
+                torch.arange(seq_len, dtype=torch.long, device=device)
+                .view(1, seq_len)
+                .expand(batch_size, seq_len)
+                .remainder(window_size)
+                .contiguous()
+            )
+            rejected = torch.zeros(batch_size, dtype=torch.int32, device=device)
+            if batch_size > 1 and seq_len > 1:
+                rejected[-1] = 1
+            request_indices = torch.arange(batch_size, dtype=torch.long, device=device)
 
-        dspark_store_main_kv(main_kv_cache, flat_kv, slots)
-        dspark_store_main_kv(
-            main_kv_cache,
-            flat_kv,
-            slots,
-            num_rejected_tokens=rejected,
-        )
-        dspark_store_main_kv(
-            main_kv_cache,
-            flat_kv,
-            slots,
-            request_indices=request_indices,
-        )
-        dspark_store_main_kv(
-            main_kv_cache,
-            flat_kv,
-            slots,
-            num_rejected_tokens=rejected,
-            request_indices=request_indices,
-        )
+            dspark_store_main_kv(main_kv_cache, flat_kv, slots)
+            dspark_store_main_kv(
+                main_kv_cache,
+                flat_kv,
+                slots,
+                num_rejected_tokens=rejected,
+            )
+            dspark_store_main_kv(
+                main_kv_cache,
+                flat_kv,
+                slots,
+                request_indices=request_indices,
+            )
+            dspark_store_main_kv(
+                main_kv_cache,
+                flat_kv,
+                slots,
+                num_rejected_tokens=rejected,
+                request_indices=request_indices,
+            )
 
 
 def _spec_decode_padded_warmup_kernels():

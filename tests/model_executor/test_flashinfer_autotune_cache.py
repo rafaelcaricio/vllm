@@ -115,6 +115,88 @@ def test_dspark_warmup_request_counts_cover_single_and_capped_multi() -> None:
     assert kernel_warmup._dspark_warmup_request_counts(worker) == (1, 4)
 
 
+def test_dspark_store_main_kv_warmup_seq_lens_cover_pruned_and_prefill() -> None:
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="dspark",
+                num_speculative_tokens=5,
+            )
+        ),
+        model_runner=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(sliding_window=128)
+            )
+        ),
+    )
+
+    assert kernel_warmup._dspark_store_main_kv_warmup_seq_lens(worker) == (
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        128,
+    )
+
+
+def test_dspark_store_main_kv_warmup_uses_pruned_and_prefill_shapes(
+    monkeypatch,
+) -> None:
+    calls = []
+    fake_module = ModuleType("vllm.models.deepseek_v4.nvidia.dspark_kernels")
+
+    def fake_store(main_kv_cache, flat_kv, slots, **kwargs):
+        calls.append(
+            (
+                tuple(main_kv_cache.shape),
+                tuple(flat_kv.shape),
+                tuple(slots.shape),
+                kwargs.get("num_rejected_tokens") is not None,
+                kwargs.get("request_indices") is not None,
+            )
+        )
+        return main_kv_cache
+
+    fake_module.dspark_store_main_kv = fake_store
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.models.deepseek_v4.nvidia.dspark_kernels",
+        fake_module,
+    )
+
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="dspark",
+                num_speculative_tokens=5,
+            )
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        model_runner=SimpleNamespace(
+            device=torch.device("cpu"),
+            dtype=torch.bfloat16,
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(head_dim=512, sliding_window=128)
+            ),
+        ),
+    )
+
+    kernel_warmup._deepseek_v4_dspark_store_main_kv_warmup(worker)
+
+    seq_lens = [call[1][1] for call in calls[0::4]]
+    assert seq_lens == [1, 2, 3, 4, 5, 6, 128]
+    assert all(call[0] == (1, 128, 512) for call in calls)
+    assert all(call[2] == (1, call[1][1]) for call in calls)
+    assert [(call[3], call[4]) for call in calls[:4]] == [
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ]
+
+
 def test_spec_decode_padded_kernel_warmup_uses_dspark_query_width(
     monkeypatch,
 ) -> None:
