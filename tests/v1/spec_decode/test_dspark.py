@@ -3,14 +3,17 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Callable, Sequence
 from itertools import product
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from transformers import PretrainedConfig
 
+import vllm.v1.spec_decode.dspark_proposer as dspark_proposer_module
 from vllm.config.speculative import SpeculativeConfig
 from vllm.v1.spec_decode.dspark import (
     DSparkDiagnostics,
@@ -74,6 +77,43 @@ def _probability_grid(
 
     extend((), total_mass)
     return out
+
+
+def test_dspark_timed_stage_adds_profiler_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, str]] = []
+
+    class Scope:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __enter__(self):
+            events.append(("enter", self.name))
+
+        def __exit__(self, *_args: object) -> None:
+            events.append(("exit", self.name))
+
+    monkeypatch.setattr(
+        dspark_proposer_module,
+        "record_function_or_nullcontext",
+        lambda name: Scope(name),
+    )
+
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer._stage_timing = False
+
+    result = DSparkProposer._timed_stage(
+        proposer,
+        "prefill_project",
+        lambda: "done",
+    )
+
+    assert result == "done"
+    assert events == [
+        ("enter", "dspark_proposer: prefill_project"),
+        ("exit", "dspark_proposer: prefill_project"),
+    ]
 
 
 def _residual_distribution(
@@ -409,14 +449,20 @@ def _manual_dspark_sparse_attention(
     valid_main_lengths: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
+    request_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_size, block_size, num_heads, head_dim = q.shape
     rows = []
     for batch_idx in range(batch_size):
         main_len = int(valid_main_lengths[batch_idx].item())
+        main_row = (
+            batch_idx
+            if request_indices is None
+            else int(request_indices[batch_idx].item())
+        )
         kv = torch.cat(
             [
-                main_kv_cache[batch_idx, :main_len],
+                main_kv_cache[main_row, :main_len],
                 draft_kv[batch_idx],
             ],
             dim=0,
@@ -608,6 +654,51 @@ def test_dspark_sparse_attention_reference_matches_manual_window_semantics() -> 
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
 
 
+def test_dspark_sparse_attention_reference_reads_selected_rows() -> None:
+    dspark_sparse_attention_torch = _dspark_kernels().dspark_sparse_attention_torch
+    batch_size = 2
+    block_size = 2
+    num_heads = 1
+    head_dim = 4
+    window_size = 3
+    q = torch.arange(
+        batch_size * block_size * num_heads * head_dim,
+        dtype=torch.float32,
+    ).view(batch_size, block_size, num_heads, head_dim)
+    draft_kv = torch.arange(
+        batch_size * block_size * head_dim,
+        dtype=torch.float32,
+    ).view(batch_size, block_size, head_dim)
+    main_kv_cache = torch.arange(
+        3 * window_size * head_dim,
+        dtype=torch.float32,
+    ).view(3, window_size, head_dim)
+    valid_main_lengths = torch.tensor([3, 2], dtype=torch.int64)
+    attn_sink = torch.tensor([0.0], dtype=torch.float32)
+    request_indices = torch.tensor([2, 0], dtype=torch.long)
+
+    actual = dspark_sparse_attention_torch(
+        q,
+        draft_kv,
+        main_kv_cache,
+        valid_main_lengths,
+        attn_sink,
+        softmax_scale=0.25,
+        request_indices=request_indices,
+    )
+    expected = _manual_dspark_sparse_attention(
+        q,
+        draft_kv,
+        main_kv_cache,
+        valid_main_lengths,
+        attn_sink,
+        softmax_scale=0.25,
+        request_indices=request_indices,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_dspark_sparse_attention_triton_matches_reference() -> None:
     kernels = _dspark_kernels()
@@ -636,7 +727,7 @@ def test_dspark_sparse_attention_triton_matches_reference() -> None:
         generator=generator,
     )
     main_kv_cache = torch.randn(
-        batch_size,
+        3,
         window_size,
         head_dim,
         device=device,
@@ -646,6 +737,7 @@ def test_dspark_sparse_attention_triton_matches_reference() -> None:
     valid_main_lengths = torch.tensor(
         [3, window_size], device=device, dtype=torch.int64
     )
+    request_indices = torch.tensor([2, 0], device=device, dtype=torch.long)
     attn_sink = torch.randn(num_heads, device=device, dtype=torch.float32)
     scores = torch.empty(
         batch_size,
@@ -664,6 +756,7 @@ def test_dspark_sparse_attention_triton_matches_reference() -> None:
         attn_sink,
         softmax_scale=head_dim**-0.5,
         scores_buffer=scores,
+        request_indices=request_indices,
     )
     expected = kernels.dspark_sparse_attention_torch(
         q,
@@ -672,6 +765,7 @@ def test_dspark_sparse_attention_triton_matches_reference() -> None:
         valid_main_lengths,
         attn_sink,
         softmax_scale=head_dim**-0.5,
+        request_indices=request_indices,
     )
 
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
@@ -999,10 +1093,13 @@ def test_dspark_proposer_requests_only_needed_draft_outputs(
             return_logits: bool,
             return_confidence: bool,
             store_main_kv: bool,
+            slot_index: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             observed_flags.append(
                 (return_logits, return_confidence, store_main_kv)
             )
+            assert slot_index is not None
+            assert slot_index.tolist() == [1, 0]
             batch_size = input_ids.shape[0]
             logits = (
                 torch.zeros(batch_size, 5, 13)
@@ -1022,6 +1119,7 @@ def test_dspark_proposer_requests_only_needed_draft_outputs(
     proposer._draft_input_ids_buffer = torch.tensor([11, 12], dtype=torch.long)
     proposer._draft_hidden_buffer = torch.zeros(2, 4)
     proposer._draft_positions_buffer = torch.arange(2, dtype=torch.long)
+    proposer._draft_slot_index_buffer = torch.tensor([1, 0], dtype=torch.long)
     proposer.confidence_threshold = confidence_threshold
     proposer._collect_confidence_diagnostics = collect_confidence_diagnostics
     proposer._export_draft_probs = export_draft_probs
@@ -1043,7 +1141,292 @@ def test_dspark_proposer_requests_only_needed_draft_outputs(
     )
 
 
-def test_dspark_hardware_scheduler_skips_confidence_when_full_prefix_dominates() -> None:
+def test_dspark_proposer_reuses_request_stable_slots_after_condense() -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.max_batch_size = 3
+    proposer._req_id_to_slot = {"stale": 0, "victim": 1}
+    proposer._free_slots = [2]
+
+    slots = DSparkProposer._row_to_slot(proposer, ["victim", "new"])
+
+    assert slots == [1, 0]
+    assert proposer._req_id_to_slot == {"victim": 1, "new": 0}
+    assert proposer._free_slots == [2]
+
+
+def test_dspark_proposer_prefill_and_draft_use_stable_slots_after_condense(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.spec_decode.dspark_proposer as dspark_proposer_module
+
+    class FakeForwardContext:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    captured_prefill_indices: list[torch.Tensor | None] = []
+    captured_draft_slots: list[torch.Tensor | None] = []
+
+    class FakeDSparkModel:
+        def prefill_main(
+            self,
+            _hidden_by_req: torch.Tensor,
+            _positions_by_req: torch.Tensor,
+            *,
+            num_rejected_tokens: torch.Tensor | None = None,
+            request_indices: torch.Tensor | None = None,
+        ) -> None:
+            del num_rejected_tokens
+            captured_prefill_indices.append(
+                None
+                if request_indices is None
+                else request_indices.detach().clone()
+            )
+
+    def capture_draft_buffers(
+        _self: DSparkProposer,
+        *,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        padded_batch_size: int,
+        slot_index: torch.Tensor | None = None,
+    ) -> None:
+        del input_ids, hidden_states, positions, padded_batch_size
+        captured_draft_slots.append(
+            None if slot_index is None else slot_index.detach().clone()
+        )
+
+    monkeypatch.setattr(
+        dspark_proposer_module,
+        "set_forward_context",
+        lambda *_args, **_kwargs: FakeForwardContext(),
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_determine_graph_batch",
+        lambda _self, batch_size: (None, batch_size, None, None),
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_prepare_draft_buffers",
+        capture_draft_buffers,
+    )
+    monkeypatch.setattr(
+        DSparkProposer,
+        "_run_draft_for_current_context",
+        lambda _self: (
+            torch.full((2, 5), 7, dtype=torch.long),
+            torch.empty(0, 0, 0),
+            torch.empty(2, 0),
+        ),
+    )
+
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.vllm_config = object()
+    proposer.device = torch.device("cpu")
+    proposer.max_batch_size = 3
+    proposer.num_speculative_tokens = 5
+    proposer.confidence_threshold = 0.0
+    proposer._collect_confidence_diagnostics = False
+    proposer._collect_position0_diagnostics = False
+    proposer._export_draft_probs = False
+    proposer._last_draft_probs = None
+    proposer._last_confidence = None
+    proposer._last_raw_confidence = None
+    proposer._last_draft_lengths = None
+    proposer._gpu_rejected_context_mask = False
+    proposer._prefilled = True
+    proposer._req_id_to_slot = {"stale": 0, "victim": 1}
+    proposer._free_slots = [2]
+    proposer.model = FakeDSparkModel()
+
+    draft_ids = DSparkProposer.propose(
+        proposer,
+        target_token_ids=torch.empty(4, dtype=torch.long),
+        target_positions=torch.arange(4, dtype=torch.long),
+        target_hidden_states=torch.zeros(4, 3),
+        next_token_ids=torch.tensor([21, 22], dtype=torch.int32),
+        token_indices_to_sample=None,
+        common_attn_metadata=None,  # type: ignore[arg-type]
+        sampling_metadata=None,  # type: ignore[arg-type]
+        req_ids=["victim", "new"],
+    )
+
+    assert draft_ids.tolist() == [[7, 7, 7, 7, 7], [7, 7, 7, 7, 7]]
+    assert len(captured_prefill_indices) == 1
+    assert captured_prefill_indices[0] is not None
+    assert captured_prefill_indices[0].tolist() == [1, 0]
+    assert len(captured_draft_slots) == 1
+    assert captured_draft_slots[0] is not None
+    assert captured_draft_slots[0].tolist() == [1, 0]
+    assert proposer._req_id_to_slot == {"victim": 1, "new": 0}
+
+
+def test_dspark_proposer_splits_uniform_prefill_projection_from_store() -> None:
+    projected_inputs: list[torch.Tensor] = []
+    stored_projected: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = []
+
+    class FakeDSparkModel:
+        def project_main_context(self, hidden_by_req: torch.Tensor) -> torch.Tensor:
+            projected_inputs.append(hidden_by_req.detach().clone())
+            return hidden_by_req + 100.0
+
+        def prefill_main_projected(
+            self,
+            projected_hidden: torch.Tensor,
+            positions_by_req: torch.Tensor,
+            *,
+            num_rejected_tokens: torch.Tensor | None = None,
+            request_indices: torch.Tensor | None = None,
+        ) -> None:
+            del num_rejected_tokens
+            stored_projected.append(
+                (
+                    projected_hidden.detach().clone(),
+                    positions_by_req.detach().clone(),
+                    None
+                    if request_indices is None
+                    else request_indices.detach().clone(),
+                )
+            )
+
+        def prefill_main(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("projected prefill path should not reproject")
+
+        def prefill_main_ragged_projected(self, *_args: object, **_kwargs: object):
+            raise AssertionError("uniform context should not use ragged prefill")
+
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.device = torch.device("cpu")
+    proposer.num_speculative_tokens = 5
+    proposer.noise_token_id = 128799
+    proposer._last_draft_probs = None
+    proposer._last_confidence = None
+    proposer._last_raw_confidence = None
+    proposer._last_draft_lengths = None
+    proposer._gpu_rejected_context_mask = False
+    proposer._prefilled = False
+    proposer.max_batch_size = 2
+    proposer._req_id_to_slot = {"stale": 0, "victim": 1}
+    proposer._free_slots = []
+    proposer.model = FakeDSparkModel()
+
+    hidden = torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
+    draft_ids = DSparkProposer.propose(
+        proposer,
+        target_token_ids=torch.empty(2, dtype=torch.long),
+        target_positions=torch.arange(4, dtype=torch.long),
+        target_hidden_states=hidden,
+        next_token_ids=torch.tensor([11, 12], dtype=torch.int32),
+        token_indices_to_sample=None,
+        common_attn_metadata=None,  # type: ignore[arg-type]
+        sampling_metadata=None,  # type: ignore[arg-type]
+        req_ids=["victim", "fresh"],
+    )
+
+    expected_hidden_by_req = hidden.view(2, 2, 3)
+    assert len(projected_inputs) == 1
+    torch.testing.assert_close(projected_inputs[0], expected_hidden_by_req)
+    assert len(stored_projected) == 1
+    stored_hidden, stored_positions, stored_slots = stored_projected[0]
+    torch.testing.assert_close(stored_hidden, expected_hidden_by_req + 100.0)
+    torch.testing.assert_close(stored_positions, torch.tensor([[0, 1], [2, 3]]))
+    assert stored_slots is not None
+    assert stored_slots.tolist() == [1, 0]
+    assert draft_ids.tolist() == [[128799] * 5, [128799] * 5]
+
+
+def test_dspark_proposer_splits_ragged_prefill_projection_from_store() -> None:
+    class AttentionMetadataStub:
+        query_start_loc_cpu = torch.tensor([0, 1, 3], dtype=torch.int32)
+        query_start_loc = query_start_loc_cpu
+
+    projected_inputs: list[torch.Tensor] = []
+    stored_ragged: list[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
+    ] = []
+
+    class FakeDSparkModel:
+        def project_main_context(self, hidden: torch.Tensor) -> torch.Tensor:
+            projected_inputs.append(hidden.detach().clone())
+            return hidden + 200.0
+
+        def prefill_main_ragged_projected(
+            self,
+            projected_hidden: torch.Tensor,
+            positions: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            valid_lengths: torch.Tensor,
+            *,
+            request_indices: torch.Tensor | None = None,
+        ) -> None:
+            stored_ragged.append(
+                (
+                    projected_hidden.detach().clone(),
+                    positions.detach().clone(),
+                    query_start_loc.detach().clone(),
+                    valid_lengths.detach().clone(),
+                    None
+                    if request_indices is None
+                    else request_indices.detach().clone(),
+                )
+            )
+
+        def prefill_main_projected(self, *_args: object, **_kwargs: object):
+            raise AssertionError("ragged context should not use uniform prefill")
+
+        def prefill_main_ragged(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("projected ragged path should not reproject")
+
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.device = torch.device("cpu")
+    proposer.num_speculative_tokens = 5
+    proposer.noise_token_id = 128799
+    proposer._last_draft_probs = None
+    proposer._last_confidence = None
+    proposer._last_raw_confidence = None
+    proposer._last_draft_lengths = None
+    proposer._gpu_rejected_context_mask = False
+    proposer._prefilled = False
+    proposer.max_batch_size = 2
+    proposer._req_id_to_slot = {"stale": 0, "victim": 1}
+    proposer._free_slots = []
+    proposer.model = FakeDSparkModel()
+
+    hidden = torch.arange(3 * 3, dtype=torch.float32).reshape(3, 3)
+    positions = torch.tensor([10, 20, 21], dtype=torch.long)
+    draft_ids = DSparkProposer.propose(
+        proposer,
+        target_token_ids=torch.empty(2, dtype=torch.long),
+        target_positions=positions,
+        target_hidden_states=hidden,
+        next_token_ids=torch.tensor([11, 12], dtype=torch.int32),
+        token_indices_to_sample=None,
+        common_attn_metadata=AttentionMetadataStub(),  # type: ignore[arg-type]
+        sampling_metadata=None,  # type: ignore[arg-type]
+        req_ids=["victim", "fresh"],
+    )
+
+    assert len(projected_inputs) == 1
+    torch.testing.assert_close(projected_inputs[0], hidden)
+    assert len(stored_ragged) == 1
+    stored_hidden, stored_positions, starts, valid_lengths, stored_slots = (
+        stored_ragged[0]
+    )
+    torch.testing.assert_close(stored_hidden, hidden + 200.0)
+    torch.testing.assert_close(stored_positions, positions)
+    assert starts.tolist() == [0, 1, 3]
+    assert valid_lengths.tolist() == [1, 2]
+    assert stored_slots is not None
+    assert stored_slots.tolist() == [1, 0]
+    assert draft_ids.tolist() == [[128799] * 5, [128799] * 5]
+
+
+def test_dspark_hardware_scheduler_skips_confidence_when_full_prefix_dominates(
+) -> None:
     proposer = DSparkProposer.__new__(DSparkProposer)
     proposer.num_speculative_tokens = 5
     proposer.confidence_scheduler = "hardware"
@@ -1066,7 +1449,8 @@ def test_dspark_hardware_scheduler_skips_confidence_when_full_prefix_dominates()
     assert not DSparkProposer._needs_confidence(proposer)
 
 
-def test_dspark_hardware_scheduler_keeps_confidence_when_shorter_width_can_win() -> None:
+def test_dspark_hardware_scheduler_keeps_confidence_when_shorter_width_can_win(
+) -> None:
     proposer = DSparkProposer.__new__(DSparkProposer)
     proposer.num_speculative_tokens = 5
     proposer.confidence_scheduler = "hardware"
@@ -1442,7 +1826,7 @@ def test_dspark_proposer_rejects_non_uniform_trimmed_context() -> None:
 
     proposer = DSparkProposer.__new__(DSparkProposer)
 
-    with pytest.raises(ValueError, match="uniform effective"):
+    with pytest.raises(ValueError, match="cannot infer ragged request boundaries"):
         DSparkProposer._trim_rejected_target_context(
             proposer,
             torch.zeros(8, 2),
@@ -1549,8 +1933,9 @@ def test_dspark_proposer_gpu_mask_anchors_on_last_non_rejected_token(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         padded_batch_size: int,
+        slot_index: torch.Tensor | None = None,
     ) -> None:
-        del input_ids, padded_batch_size
+        del input_ids, padded_batch_size, slot_index
         captured_draft.append(
             (hidden_states.detach().clone(), positions.detach().clone())
         )
@@ -1633,7 +2018,7 @@ def test_dspark_proposer_gpu_mask_anchors_on_last_non_rejected_token(
     assert DSparkProposer.take_last_draft_lengths(proposer) is None
 
 
-def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
+def test_dspark_proposer_uses_ragged_prefill_for_mixed_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vllm.v1.spec_decode.dspark_proposer as dspark_proposer_module
@@ -1650,9 +2035,19 @@ def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
             return None
 
     captured_prefill: list[
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]
+        tuple[
+            str,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+            torch.Tensor | None,
+        ]
     ] = []
-    captured_draft: list[tuple[torch.Tensor, torch.Tensor]] = []
+    captured_draft: list[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
+    ] = []
 
     class FakeDSparkModel:
         def prefill_main(
@@ -1665,6 +2060,7 @@ def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
         ) -> None:
             captured_prefill.append(
                 (
+                    "uniform",
                     hidden_by_req.detach().clone(),
                     positions_by_req.detach().clone(),
                     None
@@ -1673,6 +2069,31 @@ def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
                     None
                     if request_indices is None
                     else request_indices.detach().clone(),
+                    None,
+                    None,
+                )
+            )
+
+        def prefill_main_ragged(
+            self,
+            hidden: torch.Tensor,
+            positions: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            valid_lengths: torch.Tensor,
+            *,
+            request_indices: torch.Tensor | None = None,
+        ) -> None:
+            captured_prefill.append(
+                (
+                    "ragged",
+                    hidden.detach().clone(),
+                    positions.detach().clone(),
+                    None,
+                    None
+                    if request_indices is None
+                    else request_indices.detach().clone(),
+                    query_start_loc.detach().clone(),
+                    valid_lengths.detach().clone(),
                 )
             )
 
@@ -1683,10 +2104,15 @@ def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         padded_batch_size: int,
+        slot_index: torch.Tensor | None = None,
     ) -> None:
         del input_ids, padded_batch_size
         captured_draft.append(
-            (hidden_states.detach().clone(), positions.detach().clone())
+            (
+                hidden_states.detach().clone(),
+                positions.detach().clone(),
+                None if slot_index is None else slot_index.detach().clone(),
+            )
         )
 
     monkeypatch.setattr(
@@ -1726,8 +2152,10 @@ def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
     proposer._last_confidence = None
     proposer._last_draft_lengths = None
     proposer._gpu_rejected_context_mask = True
-    proposer._multi_seq_pad = True
     proposer._prefilled = True
+    proposer.max_batch_size = 3
+    proposer._req_id_to_slot = {"stale": 0, "victim": 1, "carry": 2}
+    proposer._free_slots = []
     proposer.model = FakeDSparkModel()
 
     hidden = torch.arange(836 * 3, dtype=torch.float32).reshape(836, 3)
@@ -1749,34 +2177,39 @@ def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
         common_attn_metadata=AttentionMetadataStub(),  # type: ignore[arg-type]
         sampling_metadata=None,  # type: ignore[arg-type]
         num_rejected_tokens_gpu=torch.tensor([0, 0, 0], dtype=torch.int32),
+        req_ids=["victim", "fresh", "carry"],
     )
 
-    assert len(captured_prefill) == 2
-    long_hidden, long_positions, long_rejected, long_indices = captured_prefill[0]
-    assert long_hidden.shape == (2, 415, 3)
-    torch.testing.assert_close(long_hidden[0], hidden[:415])
-    torch.testing.assert_close(long_hidden[1], hidden[421:836])
-    torch.testing.assert_close(long_positions[0], positions[:415])
-    torch.testing.assert_close(long_positions[1], positions[421:836])
-    assert long_rejected is None
-    assert long_indices is not None
-    assert long_indices.tolist() == [0, 2]
-
-    short_hidden, short_positions, short_rejected, short_indices = captured_prefill[1]
-    assert short_hidden.shape == (1, 6, 3)
-    torch.testing.assert_close(short_hidden[0], hidden[415:421])
-    torch.testing.assert_close(short_positions[0], positions[415:421])
-    assert short_rejected is None
-    assert short_indices is not None
-    assert short_indices.tolist() == [1]
+    assert len(captured_prefill) == 1
+    (
+        prefill_mode,
+        prefill_hidden,
+        prefill_positions,
+        prefill_rejected,
+        prefill_indices,
+        prefill_starts,
+        prefill_valid_lengths,
+    ) = captured_prefill[0]
+    assert prefill_mode == "ragged"
+    torch.testing.assert_close(prefill_hidden, hidden)
+    torch.testing.assert_close(prefill_positions, positions)
+    assert prefill_rejected is None
+    assert prefill_indices is not None
+    assert prefill_indices.tolist() == [1, 0, 2]
+    assert prefill_starts is not None
+    assert prefill_starts.tolist() == [0, 415, 421, 836]
+    assert prefill_valid_lengths is not None
+    assert prefill_valid_lengths.tolist() == [415, 6, 415]
 
     assert len(captured_draft) == 1
-    draft_hidden, draft_positions = captured_draft[0]
+    draft_hidden, draft_positions, draft_slots = captured_draft[0]
     torch.testing.assert_close(
         draft_hidden,
         torch.stack([hidden[414], hidden[420], hidden[835]]),
     )
     torch.testing.assert_close(draft_positions, torch.tensor([414, 674, 1314]))
+    assert draft_slots is not None
+    assert draft_slots.tolist() == [1, 0, 2]
     assert draft_ids.tolist() == [
         [9, 9, 9, 9, 9],
         [9, 9, 9, 9, 9],
@@ -1890,6 +2323,163 @@ def test_dspark_attention_store_main_kv_masks_rejected_selected_rows() -> None:
     torch.testing.assert_close(attn.main_kv_cache, expected)
 
 
+def test_dspark_attention_forward_reads_selected_main_kv_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dspark_module = _dspark_model_module()
+
+    class StopAfterSparseAttention(Exception):
+        pass
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake_sparse_attention(
+        q: torch.Tensor,
+        draft_kv: torch.Tensor,
+        main_kv_cache: torch.Tensor,
+        valid_main_lengths: torch.Tensor,
+        *_args: object,
+        request_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del q, draft_kv
+        captured["main_kv_cache"] = main_kv_cache.detach().clone()
+        captured["valid_main_lengths"] = valid_main_lengths.detach().clone()
+        assert request_indices is not None
+        captured["request_indices"] = request_indices.detach().clone()
+        raise StopAfterSparseAttention
+
+    monkeypatch.setattr(
+        dspark_module,
+        "dspark_sparse_attention",
+        fake_sparse_attention,
+    )
+
+    attn = dspark_module.DeepSeekV4DSparkAttention.__new__(
+        dspark_module.DeepSeekV4DSparkAttention
+    )
+    torch.nn.Module.__init__(attn)
+    attn.window_size = 4
+    attn.n_local_heads = 1
+    attn.head_dim = 2
+    attn.dtype = torch.float32
+    attn.main_kv_cache = torch.arange(3 * 4 * 2, dtype=torch.float32).reshape(
+        3,
+        4,
+        2,
+    )
+    attn.attn_sink = torch.zeros(1)
+    attn.softmax_scale = 1.0
+    attn.sparse_scores = torch.zeros(3, 2, 1)
+    attn._project_q_and_draft_kv = lambda _hidden, _positions: (
+        torch.zeros(4, 1, 2),
+        torch.zeros(4, 2),
+    )
+
+    with pytest.raises(StopAfterSparseAttention):
+        dspark_module.DeepSeekV4DSparkAttention.forward_dspark(
+            attn,
+            torch.zeros(4, 2),
+            torch.arange(4, dtype=torch.long),
+            batch_size=2,
+            block_size=2,
+            main_x=torch.zeros(2, 1, 2),
+            main_positions=torch.tensor([[10], [20]], dtype=torch.long),
+            store_main_kv=False,
+            slot_index=torch.tensor([2, 0], dtype=torch.long),
+        )
+
+    torch.testing.assert_close(
+        captured["main_kv_cache"],
+        attn.main_kv_cache,
+    )
+    assert captured["request_indices"].tolist() == [2, 0]
+    torch.testing.assert_close(
+        captured["valid_main_lengths"],
+        torch.tensor([4, 4], dtype=torch.long),
+    )
+
+
+def test_dspark_sparse_attention_reads_request_stable_rows_after_condense() -> None:
+    kernels = _dspark_kernels()
+    q = torch.zeros(2, 1, 1, 2, dtype=torch.float32)
+    draft_kv = torch.zeros(2, 1, 2, dtype=torch.float32)
+    main_kv_cache = torch.stack(
+        [
+            torch.full((3, 2), 10.0),
+            torch.full((3, 2), 20.0),
+            torch.full((3, 2), 30.0),
+        ]
+    )
+    valid_main_lengths = torch.tensor([3, 3], dtype=torch.long)
+    request_indices = torch.tensor([2, 0], dtype=torch.long)
+
+    out = kernels.dspark_sparse_attention(
+        q,
+        draft_kv,
+        main_kv_cache,
+        valid_main_lengths,
+        torch.tensor([-1000.0]),
+        1.0,
+        torch.empty(2, 1, 1, 4),
+        request_indices=request_indices,
+    ).view(2, 1, 1, 2)
+
+    expected = torch.tensor(
+        [
+            [[[22.5, 22.5]]],
+            [[[7.5, 7.5]]],
+        ]
+    )
+    torch.testing.assert_close(out, expected)
+
+
+def test_deepseek_v4_nvfp4_ds_mla_uses_stage_c_padded_page_size() -> None:
+    from vllm.v1.kv_cache_interface import (
+        KVQuantMode,
+        MLAAttentionSpec,
+        get_kv_quant_mode,
+    )
+
+    assert get_kv_quant_mode("nvfp4_ds_mla") == KVQuantMode.NVFP4
+
+    deepseek_v4_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+        model_version="deepseek_v4",
+    )
+    generic_nvfp4_spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+    )
+
+    assert deepseek_v4_spec.real_page_size_bytes == 256 * 584
+    assert generic_nvfp4_spec.real_page_size_bytes == 256 * 416
+
+
+def test_deepseek_v4_flashmla_nvfp4_ds_mla_uses_padded_shape() -> None:
+    flashmla = pytest.importorskip(
+        "vllm.models.deepseek_v4.nvidia.flashmla",
+        reason="DeepSeek V4 FlashMLA extensions are unavailable",
+        exc_type=ImportError,
+    )
+
+    shape = flashmla.DeepseekV4FlashMLASparseBackend.get_kv_cache_shape(
+        3,
+        256,
+        1,
+        512,
+        "nvfp4_ds_mla",
+    )
+
+    assert shape == (3, 256, 584)
+
+
 def test_dspark_store_main_kv_torch_updates_selected_rows_without_copy_bridge() -> None:
     kernels = _dspark_kernels()
     main_kv_cache = torch.arange(3 * 4 * 2, dtype=torch.float32).reshape(3, 4, 2)
@@ -1915,6 +2505,44 @@ def test_dspark_store_main_kv_torch_updates_selected_rows_without_copy_bridge() 
     expected[2, 0] = flat_kv[0, 0]
     expected[2, 2] = flat_kv[0, 1]
     expected[0, 1] = flat_kv[1, 0]
+    torch.testing.assert_close(main_kv_cache, expected)
+
+
+def test_dspark_store_main_kv_ragged_torch_updates_request_stable_rows() -> None:
+    kernels = _dspark_kernels()
+    main_kv_cache = torch.arange(4 * 5 * 2, dtype=torch.float32).reshape(4, 5, 2)
+    original = main_kv_cache.clone()
+    flat_kv = torch.tensor(
+        [
+            [100.0, 101.0],
+            [102.0, 103.0],
+            [104.0, 105.0],
+            [200.0, 201.0],
+            [300.0, 301.0],
+            [302.0, 303.0],
+        ]
+    )
+    positions = torch.tensor([0, 1, 2, 10, 11, 12], dtype=torch.long)
+    query_start_loc = torch.tensor([0, 3, 4, 6], dtype=torch.int32)
+    valid_lengths = torch.tensor([2, 1, 2], dtype=torch.int32)
+    request_indices = torch.tensor([3, 0, 2], dtype=torch.long)
+
+    returned = kernels.dspark_store_main_kv_ragged_torch(
+        main_kv_cache,
+        flat_kv,
+        positions,
+        query_start_loc,
+        valid_lengths,
+        request_indices=request_indices,
+    )
+
+    assert returned is main_kv_cache
+    expected = original.clone()
+    expected[3, 0] = flat_kv[0]
+    expected[3, 1] = flat_kv[1]
+    expected[0, 0] = flat_kv[3]
+    expected[2, 1] = flat_kv[4]
+    expected[2, 2] = flat_kv[5]
     torch.testing.assert_close(main_kv_cache, expected)
 
 
@@ -1961,6 +2589,59 @@ def test_dspark_store_main_kv_triton_matches_reference() -> None:
         flat_kv,
         slots,
         num_rejected_tokens=rejected,
+        request_indices=request_indices,
+    )
+    torch.cuda.synchronize()
+
+    assert returned is actual
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_dspark_store_main_kv_ragged_triton_matches_reference() -> None:
+    kernels = _dspark_kernels()
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(620)
+    main_kv_cache = torch.randn(
+        5,
+        8,
+        64,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    flat_kv = torch.randn(
+        13,
+        64,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    positions = torch.tensor(
+        [0, 1, 2, 3, 8, 9, 24, 25, 26, 27, 28, 40, 41],
+        device=device,
+        dtype=torch.long,
+    )
+    query_start_loc = torch.tensor([0, 4, 6, 11, 13], device=device, dtype=torch.int32)
+    valid_lengths = torch.tensor([3, 1, 5, 2], device=device, dtype=torch.int32)
+    request_indices = torch.tensor([4, 0, 3, 1], device=device, dtype=torch.long)
+
+    expected = main_kv_cache.clone()
+    kernels.dspark_store_main_kv_ragged_torch(
+        expected,
+        flat_kv,
+        positions,
+        query_start_loc,
+        valid_lengths,
+        request_indices=request_indices,
+    )
+    actual = main_kv_cache.clone()
+    returned = kernels.dspark_store_main_kv_ragged(
+        actual,
+        flat_kv,
+        positions,
+        query_start_loc,
+        valid_lengths,
         request_indices=request_indices,
     )
     torch.cuda.synchronize()
@@ -2196,6 +2877,128 @@ def test_dspark_proposer_hardware_scheduler_uses_profiled_sps_curve() -> None:
     assert schedule.expected_tokens_per_second == pytest.approx(195.0)
 
 
+def test_dspark_proposer_isolates_draft_graph_pool_for_draft_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.spec_decode.dspark_proposer as dspark_proposer_module
+    from vllm.config import CUDAGraphMode
+
+    graph_pool = object()
+    created_wrappers: list[SimpleNamespace] = []
+
+    class FakeDispatcher:
+        def __init__(self) -> None:
+            self.initialized_modes: list[CUDAGraphMode] = []
+
+        def initialize_cudagraph_keys(self, mode: CUDAGraphMode) -> None:
+            self.initialized_modes.append(mode)
+
+    class FakeCUDAGraphWrapper:
+        def __init__(
+            self,
+            runnable: object,
+            vllm_config: object,
+            *,
+            runtime_mode: CUDAGraphMode,
+            cudagraph_options: object,
+        ) -> None:
+            created_wrappers.append(
+                SimpleNamespace(
+                    runnable=runnable,
+                    vllm_config=vllm_config,
+                    runtime_mode=runtime_mode,
+                    cudagraph_options=cudagraph_options,
+                )
+            )
+
+    monkeypatch.setattr(
+        dspark_proposer_module.current_platform,
+        "graph_pool_handle",
+        lambda: graph_pool,
+    )
+    monkeypatch.setattr(
+        dspark_proposer_module,
+        "CUDAGraphWrapper",
+        FakeCUDAGraphWrapper,
+    )
+
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.speculative_config = SimpleNamespace(enforce_eager=False)
+    proposer.cudagraph_dispatcher = FakeDispatcher()
+    proposer.device = torch.device("cuda")
+    proposer._runner = SimpleNamespace(_dspark_draft_stream_enabled=True)
+    proposer._draft_graph_pool = None
+    proposer._draft_graph_runner = None
+    proposer._run_draft_from_buffers = lambda: None
+    proposer.vllm_config = object()
+
+    DSparkProposer.initialize_cudagraph_keys(proposer, CUDAGraphMode.FULL)
+
+    assert proposer.cudagraph_dispatcher.initialized_modes == [
+        CUDAGraphMode.PIECEWISE
+    ]
+    assert proposer._draft_graph_pool is graph_pool
+    assert len(created_wrappers) == 1
+    wrapper = created_wrappers[0]
+    assert wrapper.runtime_mode == CUDAGraphMode.PIECEWISE
+    assert wrapper.cudagraph_options.graph_pool is graph_pool
+
+
+def test_dspark_proposer_uses_default_graph_pool_without_draft_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.spec_decode.dspark_proposer as dspark_proposer_module
+    from vllm.config import CUDAGraphMode
+
+    created_wrappers: list[SimpleNamespace] = []
+
+    class FakeDispatcher:
+        def initialize_cudagraph_keys(self, _mode: CUDAGraphMode) -> None:
+            return None
+
+    class FakeCUDAGraphWrapper:
+        def __init__(
+            self,
+            _runnable: object,
+            _vllm_config: object,
+            *,
+            _runtime_mode: CUDAGraphMode | None = None,
+            runtime_mode: CUDAGraphMode | None = None,
+            cudagraph_options: object,
+        ) -> None:
+            del _runtime_mode, runtime_mode
+            created_wrappers.append(
+                SimpleNamespace(cudagraph_options=cudagraph_options)
+            )
+
+    monkeypatch.setattr(
+        dspark_proposer_module.current_platform,
+        "graph_pool_handle",
+        lambda: pytest.fail("draft stream disabled should not allocate a pool"),
+    )
+    monkeypatch.setattr(
+        dspark_proposer_module,
+        "CUDAGraphWrapper",
+        FakeCUDAGraphWrapper,
+    )
+
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.speculative_config = SimpleNamespace(enforce_eager=False)
+    proposer.cudagraph_dispatcher = FakeDispatcher()
+    proposer.device = torch.device("cuda")
+    proposer._runner = SimpleNamespace(_dspark_draft_stream_enabled=False)
+    proposer._draft_graph_pool = None
+    proposer._draft_graph_runner = None
+    proposer._run_draft_from_buffers = lambda: None
+    proposer.vllm_config = object()
+
+    DSparkProposer.initialize_cudagraph_keys(proposer, CUDAGraphMode.FULL)
+
+    assert proposer._draft_graph_pool is None
+    assert len(created_wrappers) == 1
+    assert created_wrappers[0].cudagraph_options.graph_pool is None
+
+
 def test_gpu_model_runner_trims_dspark_draft_rows_by_confidence_lengths() -> None:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -2221,6 +3024,38 @@ def test_gpu_model_runner_trims_dspark_draft_rows_by_confidence_lengths() -> Non
 
     assert req_ids == ["a", "b"]
     assert draft_token_ids == [[11, 12], []]
+
+
+def test_gpu_model_runner_maps_dspark_sts_confidence_by_request_id() -> None:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    class FakeSchedulerOutput:
+        scheduled_spec_decode_tokens = {
+            "victim": [11, 12, 13],
+            "new": [21],
+            "missing": [31, 32],
+        }
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._dspark_sts_calibration_diagnostics = True
+    runner._draft_raw_confidence = torch.tensor(
+        [
+            [0.10, 0.20, 0.30, 0.40, 0.50],
+            [0.60, 0.70, 0.80, 0.90, 0.99],
+        ],
+        dtype=torch.float32,
+    )
+    runner._draft_raw_confidence_req_ids = ["new", "victim"]
+
+    confidence = GPUModelRunner._make_dspark_sts_calibration_confidence(
+        runner,
+        FakeSchedulerOutput(),
+    )
+
+    assert confidence is not None
+    assert set(confidence) == {"victim", "new"}
+    assert confidence["victim"] == pytest.approx((0.60, 0.70, 0.80))
+    assert confidence["new"] == pytest.approx((0.10,))
 
 
 def test_infer_dspark_weight_prefix_rejects_multiple_prefixes() -> None:
@@ -2405,6 +3240,236 @@ def test_gpu_model_runner_observes_dspark_position0_quality() -> None:
     assert snapshot.avg_confidence_when_matched == pytest.approx(0.9)
     assert snapshot.avg_confidence_when_missed == pytest.approx(0.2)
     assert snapshot.num_confidence_logits_normalized == 0
+
+
+def test_gpu_model_runner_dspark_pending_event_fenced_before_state_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._dspark_iter_timing = False
+    pending_event = object()
+    runner._dspark_draft_pending_event = pending_event
+    sentinel = object()
+    runner._draft_token_ids = sentinel
+    runner._draft_token_lengths_cpu = sentinel
+    runner._draft_token_length_req_ids = sentinel
+    runner._draft_probs = sentinel
+    runner._draft_prob_req_ids = sentinel
+    runner._draft_confidence = sentinel
+    runner._draft_confidence_req_ids = sentinel
+    runner._draft_raw_confidence = sentinel
+    runner._draft_raw_confidence_req_ids = sentinel
+    runner._draft_token_req_ids = sentinel
+    runner.valid_sampled_token_count_gpu = sentinel
+    runner.input_batch = SimpleNamespace(prev_sampled_token_ids=sentinel)
+
+    waited: list[object] = []
+
+    class FakeStream:
+        def wait_event(self, event: object) -> None:
+            # The pending event must be consumed before proposer-owned state is
+            # cleared or reused for the next draft.
+            assert runner._draft_token_ids is sentinel
+            waited.append(event)
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: FakeStream())
+
+    GPUModelRunner._clear_dspark_draft_state_after_pending_fence(runner)
+
+    assert waited == [pending_event]
+    assert runner._dspark_draft_pending_event is None
+    assert runner._draft_token_ids is None
+    assert runner._draft_token_lengths_cpu is None
+    assert runner._draft_token_length_req_ids is None
+    assert runner._draft_probs is None
+    assert runner._draft_prob_req_ids is None
+    assert runner._draft_confidence is None
+    assert runner._draft_confidence_req_ids is None
+    assert runner._draft_raw_confidence is None
+    assert runner._draft_raw_confidence_req_ids is None
+    assert runner._draft_token_req_ids is None
+    assert runner.valid_sampled_token_count_gpu is None
+    assert runner.input_batch.prev_sampled_token_ids is None
+
+
+def test_gpu_model_runner_dspark_explicit_event_fence_preserves_newer_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._dspark_iter_timing = False
+    newer_pending = object()
+    explicit_event = object()
+    runner._dspark_draft_pending_event = newer_pending
+
+    waited: list[object] = []
+
+    class FakeStream:
+        def wait_event(self, event: object) -> None:
+            waited.append(event)
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: FakeStream())
+
+    GPUModelRunner._fence_pending_dspark_draft_stream(
+        runner,
+        explicit_event,  # type: ignore[arg-type]
+    )
+
+    assert waited == [explicit_event]
+    assert runner._dspark_draft_pending_event is newer_pending
+
+
+def test_gpu_model_runner_dspark_input_ids_scatter_fences_before_draft_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.enable_prompt_embeds = False
+    runner.pin_memory = False
+    runner.device = torch.device("cpu")
+    runner.num_spec_tokens = 5
+    runner.prev_positions = SimpleNamespace(np=np.array([0], dtype=np.int32))
+    runner._draft_token_ids = torch.tensor(
+        [[201, 202, 203, 204, 205]],
+        dtype=torch.int64,
+    )
+    runner.input_batch = SimpleNamespace(
+        prev_sampled_token_ids=torch.tensor([[101]], dtype=torch.int32),
+        req_ids=["req-a"],
+    )
+
+    class FakeInputIds:
+        def __init__(self) -> None:
+            self.gpu = torch.full((6,), -1, dtype=torch.int32)
+
+        def copy_to_gpu(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("unchanged async spec path should not copy CPU ids")
+
+    runner.input_ids = FakeInputIds()
+    fences: list[str] = []
+    monkeypatch.setattr(
+        runner,
+        "_fence_pending_dspark_draft_stream",
+        lambda *_args, **_kwargs: fences.append("fenced"),
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={"req-a": [201, 202, 203, 204, 205]},
+    )
+
+    GPUModelRunner._prepare_input_ids(
+        runner,
+        scheduler_output,  # type: ignore[arg-type]
+        num_reqs=1,
+        total_num_scheduled_tokens=6,
+        cu_num_tokens=np.array([6], dtype=np.int32),
+    )
+
+    assert fences == ["fenced"]
+    assert runner.input_ids.gpu.tolist() == [101, 201, 202, 203, 204, 205]
+
+
+def test_gpu_model_runner_dspark_input_ids_churn_uses_previous_request_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.enable_prompt_embeds = False
+    runner.pin_memory = False
+    runner.device = torch.device("cpu")
+    runner.num_spec_tokens = 5
+    # Current batch has one new request, then two survivors in reversed order.
+    runner.prev_positions = SimpleNamespace(np=np.array([-1, 1, 0], dtype=np.int32))
+    runner._draft_token_ids = torch.tensor(
+        [
+            [201, 202, 203, 204, 205],
+            [301, 302, 303, 304, 305],
+        ],
+        dtype=torch.int64,
+    )
+    runner.input_batch = SimpleNamespace(
+        prev_sampled_token_ids=torch.tensor(
+            [[101], [102]],
+            dtype=torch.int32,
+        ),
+        req_ids=["new", "survivor-b", "survivor-a"],
+    )
+
+    fences: list[str] = []
+
+    class FakeInputIds:
+        def __init__(self) -> None:
+            self.gpu = torch.full((6,), -9, dtype=torch.int32)
+
+        def copy_to_gpu(self, total_num_scheduled_tokens: int) -> None:
+            # New request CPU tokens may be uploaded before fencing the pending
+            # draft stream, but draft/proposer rows must not be read yet.
+            assert total_num_scheduled_tokens == 6
+            assert fences == []
+            self.gpu.copy_(torch.tensor([111, -9, -9, -9, -9, -9], dtype=torch.int32))
+
+    runner.input_ids = FakeInputIds()
+    monkeypatch.setattr(
+        runner,
+        "_fence_pending_dspark_draft_stream",
+        lambda *_args, **_kwargs: fences.append("fenced"),
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_spec_decode_tokens={
+            "survivor-b": [301, 302],
+            "survivor-a": [201],
+        },
+    )
+
+    GPUModelRunner._prepare_input_ids(
+        runner,
+        scheduler_output,  # type: ignore[arg-type]
+        num_reqs=3,
+        total_num_scheduled_tokens=6,
+        cu_num_tokens=np.array([1, 4, 6], dtype=np.int32),
+    )
+
+    assert fences == ["fenced"]
+    assert runner.input_ids.gpu.tolist() == [111, 102, 301, 302, 101, 201]
+
+
+def test_gpu_model_runner_dspark_target_tail_timing_records_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vllm.v1.worker.gpu_model_runner as gpu_model_runner
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._dspark_iter_timing = True
+    runner._dspark_iter_timing_totals_ms = defaultdict(float)
+    runner._dspark_target_tail_timing_started = 0.0
+    runner.device = torch.device("cpu")
+    runner.speculative_config = SimpleNamespace(use_dspark=lambda: True)
+
+    times = iter((10.0, 10.125))
+    monkeypatch.setattr(
+        gpu_model_runner.time,
+        "perf_counter",
+        lambda: next(times),
+    )
+
+    GPUModelRunner._mark_dspark_target_forward_done_for_tail_timing(runner)
+    assert runner._dspark_target_tail_timing_started == pytest.approx(10.0)
+
+    GPUModelRunner._record_dspark_target_tail_to_draft_start(runner)
+    assert runner._dspark_target_tail_timing_started == 0.0
+    assert runner._dspark_iter_timing_totals_ms[
+        "target_forward_done_to_draft_start"
+    ] == pytest.approx(125.0)
+
+    GPUModelRunner._record_dspark_target_tail_to_draft_start(runner)
+    assert runner._dspark_iter_timing_totals_ms[
+        "target_forward_done_to_draft_start"
+    ] == pytest.approx(125.0)
 
 
 def test_cumulative_survival_multiplies_conditional_confidences() -> None:

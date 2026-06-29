@@ -140,6 +140,7 @@ class CUDAGraphOptions:
     debug_log_enable: bool = True
     gc_disable: bool = False
     weak_ref_output: bool = True
+    graph_pool: Any | None = None
 
 
 class CUDAGraphWrapper:
@@ -194,14 +195,17 @@ class CUDAGraphWrapper:
         # assert runtime_mode is not NONE(no cudagraph), otherwise, we don't
         # need to initialize a CUDAGraphWrapper.
         assert self.runtime_mode != CUDAGraphMode.NONE
-        # TODO: in the future, if we want to use multiple
-        # streams, it might not be safe to share a global pool.
-        # only investigate this when we use multiple streams
-        self.graph_pool = current_platform.get_global_graph_pool()
-
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
         self.cudagraph_options = cudagraph_options
+        # By default all CUDA graph wrappers share the global pool because vLLM
+        # replays them serially on one stream. Multi-stream callers can provide
+        # an isolated pool to avoid cross-stream graph-pool aliasing.
+        self.graph_pool = (
+            cudagraph_options.graph_pool
+            if cudagraph_options.graph_pool is not None
+            else current_platform.get_global_graph_pool()
+        )
         # the entries for different batch descriptors that we need to capture
         # cudagraphs for.
         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry] = {}

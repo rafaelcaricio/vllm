@@ -194,10 +194,107 @@ def _dspark_store_main_kv_kernel(
 
 
 @triton.jit
+def _dspark_store_main_kv_ragged_kernel(
+    main_kv_cache_ptr,
+    flat_kv_ptr,
+    positions_ptr,
+    query_start_loc_ptr,
+    valid_lengths_ptr,
+    request_indices_ptr,
+    batch_size,
+    num_rows,
+    head_dim: tl.constexpr,
+    window_size: tl.constexpr,
+    cache_stride_b,
+    cache_stride_s,
+    cache_stride_d,
+    flat_stride_t,
+    flat_stride_d,
+    positions_stride_t,
+    query_start_stride_b,
+    valid_lengths_stride_b,
+    request_indices_stride_b,
+    HAS_REQUEST_INDICES: tl.constexpr,
+    MAX_BATCH_SIZE: tl.constexpr,
+    D_BLOCK: tl.constexpr,
+):
+    pid_t = tl.program_id(0).to(tl.int64)
+    pid_d = tl.program_id(1).to(tl.int64)
+    offs_d = pid_d * D_BLOCK + tl.arange(0, D_BLOCK)
+    valid_d = offs_d < head_dim
+
+    req_idx = tl.full((), 0, dtype=tl.int64)
+    req_start = tl.full((), 0, dtype=tl.int64)
+    req_valid_len = tl.full((), 0, dtype=tl.int64)
+    in_any_req = tl.full((), False, dtype=tl.int1)
+    for candidate in tl.static_range(0, MAX_BATCH_SIZE):
+        candidate_i64 = tl.full((), candidate, dtype=tl.int64)
+        is_live_req = candidate_i64 < batch_size
+        start = tl.load(
+            query_start_loc_ptr + candidate_i64 * query_start_stride_b,
+            mask=is_live_req,
+            other=0,
+        ).to(tl.int64)
+        end = tl.load(
+            query_start_loc_ptr + (candidate_i64 + 1) * query_start_stride_b,
+            mask=is_live_req,
+            other=0,
+        ).to(tl.int64)
+        in_req = is_live_req & (pid_t >= start) & (pid_t < end)
+        valid_len = tl.load(
+            valid_lengths_ptr + candidate_i64 * valid_lengths_stride_b,
+            mask=is_live_req,
+            other=0,
+        ).to(tl.int64)
+        req_idx = tl.where(in_req, candidate_i64, req_idx)
+        req_start = tl.where(in_req, start, req_start)
+        req_valid_len = tl.where(in_req, valid_len, req_valid_len)
+        in_any_req = in_any_req | in_req
+
+    store_row = req_idx
+    if HAS_REQUEST_INDICES:
+        store_row = tl.load(
+            request_indices_ptr + req_idx * request_indices_stride_b,
+            mask=in_any_req,
+            other=0,
+        ).to(tl.int64)
+
+    valid_end = req_start + req_valid_len
+    window_start = tl.maximum(req_start, valid_end - window_size)
+    should_store = (
+        (pid_t < num_rows)
+        & in_any_req
+        & (pid_t >= window_start)
+        & (pid_t < valid_end)
+        & valid_d
+    )
+    position = tl.load(
+        positions_ptr + pid_t * positions_stride_t,
+        mask=(pid_t < num_rows) & in_any_req,
+        other=0,
+    ).to(tl.int64)
+    slot = position % window_size
+    values = tl.load(
+        flat_kv_ptr + pid_t * flat_stride_t + offs_d * flat_stride_d,
+        mask=(pid_t < num_rows) & valid_d,
+        other=0.0,
+    )
+    tl.store(
+        main_kv_cache_ptr
+        + store_row * cache_stride_b
+        + slot * cache_stride_s
+        + offs_d * cache_stride_d,
+        values,
+        mask=should_store,
+    )
+
+
+@triton.jit
 def _dspark_sparse_scores_kernel(
     q_ptr,
     draft_kv_ptr,
     main_kv_ptr,
+    request_indices_ptr,
     valid_main_lengths_ptr,
     scores_ptr,
     softmax_scale: tl.constexpr,
@@ -211,6 +308,7 @@ def _dspark_sparse_scores_kernel(
     main_stride_b,
     main_stride_k,
     main_stride_d,
+    request_indices_stride_b,
     scores_stride_b,
     scores_stride_q,
     scores_stride_h,
@@ -222,6 +320,7 @@ def _dspark_sparse_scores_kernel(
     KV_TOKENS: tl.constexpr,
     K_BLOCK: tl.constexpr,
     D_BLOCK: tl.constexpr,
+    HAS_REQUEST_INDICES: tl.constexpr,
     NEG_INF: tl.constexpr,
 ):
     pid_bqh = tl.program_id(0).to(tl.int64)
@@ -231,6 +330,13 @@ def _dspark_sparse_scores_kernel(
     tmp = pid_bqh // NUM_HEADS
     q_idx = tmp % BLOCK_SIZE
     batch_idx = tmp // BLOCK_SIZE
+    main_row = batch_idx
+    if HAS_REQUEST_INDICES:
+        main_row = tl.load(
+            request_indices_ptr + batch_idx * request_indices_stride_b,
+            mask=batch_idx >= 0,
+            other=0,
+        ).to(tl.int64)
 
     offs_k = pid_k * K_BLOCK + tl.arange(0, K_BLOCK)
     valid_main_len = tl.load(valid_main_lengths_ptr + batch_idx).to(tl.int64)
@@ -251,7 +357,7 @@ def _dspark_sparse_scores_kernel(
 
         main_vals = tl.load(
             main_kv_ptr
-            + batch_idx * main_stride_b
+            + main_row * main_stride_b
             + offs_k[:, None] * main_stride_k
             + offs_d[None, :] * main_stride_d,
             mask=(offs_k[:, None] < WINDOW_SIZE),
@@ -287,6 +393,7 @@ def _dspark_sparse_out_kernel(
     scores_ptr,
     draft_kv_ptr,
     main_kv_ptr,
+    request_indices_ptr,
     attn_sink_ptr,
     out_ptr,
     draft_stride_b,
@@ -295,6 +402,7 @@ def _dspark_sparse_out_kernel(
     main_stride_b,
     main_stride_k,
     main_stride_d,
+    request_indices_stride_b,
     scores_stride_b,
     scores_stride_q,
     scores_stride_h,
@@ -310,6 +418,7 @@ def _dspark_sparse_out_kernel(
     KV_TOKENS: tl.constexpr,
     K_BLOCK: tl.constexpr,
     D_BLOCK: tl.constexpr,
+    HAS_REQUEST_INDICES: tl.constexpr,
     NEG_INF: tl.constexpr,
 ):
     pid_bqh = tl.program_id(0).to(tl.int64)
@@ -319,6 +428,13 @@ def _dspark_sparse_out_kernel(
     tmp = pid_bqh // NUM_HEADS
     q_idx = tmp % BLOCK_SIZE
     batch_idx = tmp // BLOCK_SIZE
+    main_row = batch_idx
+    if HAS_REQUEST_INDICES:
+        main_row = tl.load(
+            request_indices_ptr + batch_idx * request_indices_stride_b,
+            mask=batch_idx >= 0,
+            other=0,
+        ).to(tl.int64)
 
     offs_k = tl.arange(0, K_BLOCK)
     scores = tl.load(
@@ -339,7 +455,7 @@ def _dspark_sparse_out_kernel(
     offs_d = pid_d * D_BLOCK + tl.arange(0, D_BLOCK)
     main_vals = tl.load(
         main_kv_ptr
-        + batch_idx * main_stride_b
+        + main_row * main_stride_b
         + offs_k[:, None] * main_stride_k
         + offs_d[None, :] * main_stride_d,
         mask=(offs_k[:, None] < WINDOW_SIZE) & (offs_d[None, :] < HEAD_DIM),
@@ -883,6 +999,162 @@ def dspark_store_main_kv(
     return main_kv_cache
 
 
+def dspark_store_main_kv_ragged_torch(
+    main_kv_cache: torch.Tensor,
+    flat_kv: torch.Tensor,
+    flat_positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    request_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Reference in-place DSpark main-KV update for flat ragged rows."""
+
+    if flat_kv.ndim != 2:
+        raise ValueError(
+            "DSpark ragged main-KV update expects flat_kv with shape "
+            f"[num_rows, head_dim], got {tuple(flat_kv.shape)}."
+        )
+    num_rows, head_dim = flat_kv.shape
+    batch_size = int(valid_lengths.numel())
+    starts = query_start_loc.to(device=flat_kv.device, dtype=torch.long).view(-1)
+    if starts.numel() != batch_size + 1:
+        raise ValueError(
+            "DSpark ragged main-KV update requires query_start_loc to have "
+            f"batch_size + 1 entries, got {starts.numel()} for "
+            f"batch_size={batch_size}."
+        )
+    if int(starts[-1].item()) != num_rows:
+        raise ValueError(
+            "DSpark ragged main-KV update received inconsistent "
+            f"query_start_loc ending at {int(starts[-1].item())} for "
+            f"{num_rows} flat rows."
+        )
+    valid = valid_lengths.to(device=flat_kv.device, dtype=torch.long).view(-1)
+    rows = (
+        torch.arange(batch_size, device=flat_kv.device, dtype=torch.long)
+        if request_indices is None
+        else request_indices.to(device=flat_kv.device, dtype=torch.long).view(-1)
+    )
+    if rows.numel() != batch_size:
+        raise ValueError(
+            "DSpark ragged request_indices must have one row per request; "
+            f"got {rows.numel()} indices for batch_size={batch_size}."
+        )
+
+    positions = flat_positions.to(device=flat_kv.device, dtype=torch.long).view(-1)
+    if positions.numel() != num_rows:
+        raise ValueError(
+            "DSpark ragged main-KV update requires one position per flat row; "
+            f"got {positions.numel()} positions for {num_rows} rows."
+        )
+    window_size = main_kv_cache.shape[1]
+    for batch_idx in range(batch_size):
+        start = int(starts[batch_idx].item())
+        valid_len = int(valid[batch_idx].item())
+        if valid_len <= 0:
+            continue
+        end = min(start + valid_len, int(starts[batch_idx + 1].item()))
+        start = max(start, end - window_size)
+        if end <= start:
+            continue
+        row = int(rows[batch_idx].item())
+        row_slots = positions[start:end].remainder(window_size)
+        main_kv_cache[row].scatter_(
+            0,
+            row_slots.view(-1, 1).expand(-1, head_dim),
+            flat_kv[start:end],
+        )
+    return main_kv_cache
+
+
+def dspark_store_main_kv_ragged(
+    main_kv_cache: torch.Tensor,
+    flat_kv: torch.Tensor,
+    flat_positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    request_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """In-place DSpark main-KV cache update for flat ragged target rows."""
+
+    if flat_kv.ndim != 2:
+        return dspark_store_main_kv_ragged_torch(
+            main_kv_cache,
+            flat_kv,
+            flat_positions,
+            query_start_loc,
+            valid_lengths,
+            request_indices=request_indices,
+        )
+    num_rows, head_dim = flat_kv.shape
+    if head_dim <= 0 or num_rows <= 0:
+        return main_kv_cache
+    if (
+        not main_kv_cache.is_cuda
+        or not flat_kv.is_cuda
+        or not HAS_TRITON
+    ):
+        return dspark_store_main_kv_ragged_torch(
+            main_kv_cache,
+            flat_kv,
+            flat_positions,
+            query_start_loc,
+            valid_lengths,
+            request_indices=request_indices,
+        )
+
+    batch_size = int(valid_lengths.numel())
+    if batch_size <= 0:
+        return main_kv_cache
+    positions = flat_positions.to(device=flat_kv.device, dtype=torch.long).view(-1)
+    starts = query_start_loc.to(device=flat_kv.device, dtype=torch.long).view(-1)
+    valid = valid_lengths.to(device=flat_kv.device, dtype=torch.long).view(-1)
+    indices = request_indices
+    if indices is None:
+        indices = valid
+    else:
+        indices = indices.to(device=flat_kv.device, dtype=torch.long).view(-1)
+
+    if starts.numel() != batch_size + 1 or positions.numel() != num_rows:
+        return dspark_store_main_kv_ragged_torch(
+            main_kv_cache,
+            flat_kv,
+            flat_positions,
+            query_start_loc,
+            valid_lengths,
+            request_indices=request_indices,
+        )
+    max_batch_size = triton.next_power_of_2(batch_size)
+    grid = (num_rows, triton.cdiv(head_dim, _DSPARK_STORE_D_BLOCK))
+    _dspark_store_main_kv_ragged_kernel[grid](
+        main_kv_cache,
+        flat_kv,
+        positions,
+        starts,
+        valid,
+        indices,
+        batch_size,
+        num_rows,
+        head_dim,
+        main_kv_cache.shape[1],
+        main_kv_cache.stride(0),
+        main_kv_cache.stride(1),
+        main_kv_cache.stride(2),
+        flat_kv.stride(0),
+        flat_kv.stride(1),
+        positions.stride(0),
+        starts.stride(0),
+        valid.stride(0),
+        indices.stride(0),
+        HAS_REQUEST_INDICES=request_indices is not None,
+        MAX_BATCH_SIZE=max_batch_size,
+        D_BLOCK=_DSPARK_STORE_D_BLOCK,
+        num_warps=4,
+        num_stages=4,
+    )
+    return main_kv_cache
+
+
 def dspark_sparse_attention_torch(
     q: torch.Tensor,
     draft_kv: torch.Tensor,
@@ -890,12 +1162,22 @@ def dspark_sparse_attention_torch(
     valid_main_lengths: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
+    request_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reference DSpark sparse attention matching the CUDA kernel contract."""
 
     batch_size, block_size, num_heads, head_dim = q.shape
     window_size = main_kv_cache.shape[1]
-    main_kv = main_kv_cache[:batch_size]
+    if request_indices is None:
+        main_kv = main_kv_cache[:batch_size]
+    else:
+        rows = request_indices.to(device=q.device, dtype=torch.long).view(-1)
+        if rows.shape[0] != batch_size:
+            raise ValueError(
+                "DSpark request_indices must have one row per draft request; "
+                f"got {rows.shape[0]} indices for batch_size={batch_size}."
+            )
+        main_kv = main_kv_cache.index_select(0, rows)
     kv = torch.cat([main_kv, draft_kv], dim=1)
     kv_tokens = window_size + block_size
 
@@ -930,6 +1212,7 @@ def dspark_sparse_attention(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     scores_buffer: torch.Tensor,
+    request_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run DSpark sparse attention with a Triton CUDA kernel when available."""
 
@@ -941,6 +1224,7 @@ def dspark_sparse_attention(
             valid_main_lengths,
             attn_sink,
             softmax_scale,
+            request_indices=request_indices,
         )
 
     batch_size, block_size, num_heads, head_dim = q.shape
@@ -948,6 +1232,11 @@ def dspark_sparse_attention(
     kv_tokens = window_size + block_size
     assert scores_buffer.shape[:4] == (batch_size, block_size, num_heads, kv_tokens)
     assert head_dim % 64 == 0
+    if request_indices is not None and request_indices.numel() != batch_size:
+        raise ValueError(
+            "DSpark request_indices must have one row per draft request; "
+            f"got {request_indices.numel()} indices for batch_size={batch_size}."
+        )
 
     scores = scores_buffer
     out = torch.empty_like(q)
@@ -955,6 +1244,12 @@ def dspark_sparse_attention(
     k_out_block = _next_power_of_2(kv_tokens)
     d_score_block = 64
     d_out_block = 32
+    indices = request_indices
+    if indices is None:
+        indices = valid_main_lengths
+    elif not indices.is_cuda:
+        indices = indices.to(device=q.device, non_blocking=True)
+    indices = indices.to(dtype=torch.long)
 
     grid_scores = (
         batch_size * block_size * num_heads,
@@ -964,6 +1259,7 @@ def dspark_sparse_attention(
         q,
         draft_kv,
         main_kv_cache,
+        indices,
         valid_main_lengths,
         scores,
         softmax_scale,
@@ -977,6 +1273,7 @@ def dspark_sparse_attention(
         main_kv_cache.stride(0),
         main_kv_cache.stride(1),
         main_kv_cache.stride(2),
+        indices.stride(0),
         scores.stride(0),
         scores.stride(1),
         scores.stride(2),
@@ -988,6 +1285,7 @@ def dspark_sparse_attention(
         KV_TOKENS=kv_tokens,
         K_BLOCK=k_score_block,
         D_BLOCK=d_score_block,
+        HAS_REQUEST_INDICES=request_indices is not None,
         NEG_INF=_NEG_INF,
         num_warps=2,
         num_stages=4,
@@ -1001,6 +1299,7 @@ def dspark_sparse_attention(
         scores,
         draft_kv,
         main_kv_cache,
+        indices,
         attn_sink,
         out,
         draft_kv.stride(0),
@@ -1009,6 +1308,7 @@ def dspark_sparse_attention(
         main_kv_cache.stride(0),
         main_kv_cache.stride(1),
         main_kv_cache.stride(2),
+        indices.stride(0),
         scores.stride(0),
         scores.stride(1),
         scores.stride(2),
@@ -1024,6 +1324,7 @@ def dspark_sparse_attention(
         KV_TOKENS=kv_tokens,
         K_BLOCK=k_out_block,
         D_BLOCK=d_out_block,
+        HAS_REQUEST_INDICES=request_indices is not None,
         NEG_INF=_NEG_INF,
         num_warps=8,
         num_stages=4,

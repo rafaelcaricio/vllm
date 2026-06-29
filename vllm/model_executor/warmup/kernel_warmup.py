@@ -194,7 +194,16 @@ def _dspark_route_pack_token_counts(worker: "Worker") -> tuple[int, ...]:
 
 def _dspark_warmup_request_counts(worker: "Worker") -> tuple[int, ...]:
     max_num_seqs = max(1, int(worker.scheduler_config.max_num_seqs))
-    return tuple(sorted({1, min(max_num_seqs, 4)}))
+    return tuple(
+        sorted(
+            {
+                1,
+                min(max_num_seqs, 4),
+                min(max_num_seqs, 8),
+                min(max_num_seqs, 16),
+            }
+        )
+    )
 
 
 def _dspark_store_main_kv_warmup_seq_lens(worker: "Worker") -> tuple[int, ...]:
@@ -431,6 +440,7 @@ def _deepseek_v4_dspark_store_main_kv_warmup(worker: "Worker") -> None:
     try:
         from vllm.models.deepseek_v4.nvidia.dspark_kernels import (
             dspark_store_main_kv,
+            dspark_store_main_kv_ragged,
         )
     except ImportError:
         logger.debug("Skipping DSpark main-KV store warmup: kernel unavailable.")
@@ -486,6 +496,46 @@ def _deepseek_v4_dspark_store_main_kv_warmup(worker: "Worker") -> None:
                 flat_kv,
                 slots,
                 num_rejected_tokens=rejected,
+                request_indices=request_indices,
+            )
+
+            if batch_size == 1:
+                ragged_valid = torch.tensor(
+                    [seq_len], dtype=torch.long, device=device
+                )
+            else:
+                ragged_valid = torch.full(
+                    (batch_size,), seq_len, dtype=torch.long, device=device
+                )
+                ragged_valid[-1] = max(seq_len - 1, 0)
+            ragged_starts = torch.empty(batch_size + 1, dtype=torch.long, device=device)
+            ragged_starts[0] = 0
+            torch.cumsum(ragged_valid, dim=0, out=ragged_starts[1:])
+            ragged_rows = int(ragged_starts[-1].item())
+            if ragged_rows <= 0:
+                continue
+            ragged_positions = torch.arange(
+                ragged_rows, dtype=torch.long, device=device
+            ).remainder(window_size)
+            ragged_kv = torch.empty(
+                ragged_rows,
+                head_dim,
+                dtype=dtype,
+                device=device,
+            )
+            dspark_store_main_kv_ragged(
+                main_kv_cache,
+                ragged_kv,
+                ragged_positions,
+                ragged_starts,
+                ragged_valid,
+            )
+            dspark_store_main_kv_ragged(
+                main_kv_cache,
+                ragged_kv,
+                ragged_positions,
+                ragged_starts,
+                ragged_valid,
                 request_indices=request_indices,
             )
 

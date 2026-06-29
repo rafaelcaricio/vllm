@@ -55,6 +55,7 @@ from .dspark_kernels import (
     dspark_quant_dequant_nope,
     dspark_sparse_attention,
     dspark_store_main_kv,
+    dspark_store_main_kv_ragged,
 )
 from .model import (
     DeepseekV4MoE,
@@ -322,6 +323,32 @@ class DeepSeekV4DSparkAttention(nn.Module):
             request_indices=request_indices,
         )
 
+    def store_main_kv_ragged(
+        self,
+        main_x: torch.Tensor,
+        main_positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        request_indices: torch.Tensor | None = None,
+    ) -> None:
+        flat_main_x = main_x.reshape(-1, self.hidden_size)
+        flat_positions = main_positions.reshape(-1)
+        flat_kv = self._project_kv(flat_main_x, flat_positions)
+        if request_indices is not None:
+            request_indices = request_indices.to(
+                device=flat_main_x.device,
+                dtype=torch.long,
+                non_blocking=True,
+            ).view(-1)
+        dspark_store_main_kv_ragged(
+            self.main_kv_cache,
+            flat_kv,
+            flat_positions,
+            query_start_loc,
+            valid_lengths,
+            request_indices=request_indices,
+        )
+
     def _project_q_and_draft_kv(
         self,
         hidden_states: torch.Tensor,
@@ -348,9 +375,27 @@ class DeepSeekV4DSparkAttention(nn.Module):
         main_x: torch.Tensor,
         main_positions: torch.Tensor,
         store_main_kv: bool = True,
+        slot_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        slot_index_for_batch = None
+        if slot_index is not None:
+            slot_index_for_batch = slot_index.to(
+                device=hidden_states.device,
+                dtype=torch.long,
+                non_blocking=True,
+            ).view(-1)
+            if slot_index_for_batch.shape[0] != batch_size:
+                raise ValueError(
+                    "DSpark slot_index must have one row per draft request; "
+                    f"got {slot_index_for_batch.shape[0]} indices for "
+                    f"batch_size={batch_size}."
+                )
         if store_main_kv:
-            self.store_main_kv(main_x, main_positions)
+            self.store_main_kv(
+                main_x,
+                main_positions,
+                request_indices=slot_index_for_batch,
+            )
 
         q, draft_kv = self._project_q_and_draft_kv(hidden_states, positions)
         q = q.view(batch_size, block_size, self.n_local_heads, self.head_dim)
@@ -369,6 +414,7 @@ class DeepSeekV4DSparkAttention(nn.Module):
             self.attn_sink,
             self.softmax_scale,
             self.sparse_scores[:batch_size, :block_size],
+            request_indices=slot_index_for_batch,
         ).to(self.dtype)
         out_fp8, out_scale = fused_inv_rope_fp8_quant(
             out,
@@ -606,6 +652,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
         main_x: torch.Tensor,
         main_positions: torch.Tensor,
         store_main_kv: bool = True,
+        slot_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = x
         attn_in, post, comb = unpack_mhc_pre_outputs(
@@ -622,6 +669,7 @@ class DeepSeekV4DSparkLayer(nn.Module):
             main_x=main_x,
             main_positions=main_positions,
             store_main_kv=store_main_kv,
+            slot_index=slot_index,
         )
         x = self.hc_post(attn_out.to(self.dtype), residual, post, comb).to(self.dtype)
 
@@ -698,15 +746,17 @@ class DeepSeekV4DSparkModel(nn.Module):
         first = self.layers[self.stage_layer_keys[0]]
         return first.project_main(main_hidden)
 
-    def prefill_main(
+    def project_main_context(self, main_hidden: torch.Tensor) -> torch.Tensor:
+        main_x = self.project_main(main_hidden.reshape(-1, main_hidden.shape[-1]))
+        return main_x.view(*main_hidden.shape[:-1], self.config.hidden_size)
+
+    def prefill_main_projected(
         self,
-        main_hidden: torch.Tensor,
+        main_x: torch.Tensor,
         main_positions: torch.Tensor,
         num_rejected_tokens: torch.Tensor | None = None,
         request_indices: torch.Tensor | None = None,
     ) -> None:
-        main_x = self.project_main(main_hidden.reshape(-1, main_hidden.shape[-1]))
-        main_x = main_x.view(*main_hidden.shape[:-1], self.config.hidden_size)
         for layer in self.layers.values():
             layer.attn.store_main_kv(
                 main_x,
@@ -714,6 +764,55 @@ class DeepSeekV4DSparkModel(nn.Module):
                 num_rejected_tokens=num_rejected_tokens,
                 request_indices=request_indices,
             )
+
+    def prefill_main(
+        self,
+        main_hidden: torch.Tensor,
+        main_positions: torch.Tensor,
+        num_rejected_tokens: torch.Tensor | None = None,
+        request_indices: torch.Tensor | None = None,
+    ) -> None:
+        main_x = self.project_main_context(main_hidden)
+        self.prefill_main_projected(
+            main_x,
+            main_positions,
+            num_rejected_tokens=num_rejected_tokens,
+            request_indices=request_indices,
+        )
+
+    def prefill_main_ragged_projected(
+        self,
+        main_x: torch.Tensor,
+        main_positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        request_indices: torch.Tensor | None = None,
+    ) -> None:
+        for layer in self.layers.values():
+            layer.attn.store_main_kv_ragged(
+                main_x,
+                main_positions,
+                query_start_loc,
+                valid_lengths,
+                request_indices=request_indices,
+            )
+
+    def prefill_main_ragged(
+        self,
+        main_hidden: torch.Tensor,
+        main_positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        request_indices: torch.Tensor | None = None,
+    ) -> None:
+        main_x = self.project_main_context(main_hidden)
+        self.prefill_main_ragged_projected(
+            main_x,
+            main_positions,
+            query_start_loc,
+            valid_lengths,
+            request_indices=request_indices,
+        )
 
     def draft(
         self,
@@ -726,6 +825,7 @@ class DeepSeekV4DSparkModel(nn.Module):
         return_logits: bool = True,
         return_confidence: bool = True,
         store_main_kv: bool = True,
+        slot_index: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = input_ids.shape[0]
         block_size = self.block_size
@@ -764,6 +864,7 @@ class DeepSeekV4DSparkModel(nn.Module):
                 main_x=main_x,
                 main_positions=main_positions,
                 store_main_kv=store_main_kv,
+                slot_index=slot_index,
             )
 
         final_layer = self.layers[self.stage_layer_keys[-1]]
@@ -867,6 +968,23 @@ class DeepSeekV4DSpark(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    def project_main_context(self, main_hidden: torch.Tensor) -> torch.Tensor:
+        return self.model.project_main_context(main_hidden)
+
+    def prefill_main_projected(
+        self,
+        main_x: torch.Tensor,
+        main_positions: torch.Tensor,
+        num_rejected_tokens: torch.Tensor | None = None,
+        request_indices: torch.Tensor | None = None,
+    ) -> None:
+        self.model.prefill_main_projected(
+            main_x,
+            main_positions,
+            num_rejected_tokens=num_rejected_tokens,
+            request_indices=request_indices,
+        )
+
     def prefill_main(
         self,
         main_hidden: torch.Tensor,
@@ -881,6 +999,38 @@ class DeepSeekV4DSpark(nn.Module):
             request_indices=request_indices,
         )
 
+    def prefill_main_ragged_projected(
+        self,
+        main_x: torch.Tensor,
+        main_positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        request_indices: torch.Tensor | None = None,
+    ) -> None:
+        self.model.prefill_main_ragged_projected(
+            main_x,
+            main_positions,
+            query_start_loc,
+            valid_lengths,
+            request_indices=request_indices,
+        )
+
+    def prefill_main_ragged(
+        self,
+        main_hidden: torch.Tensor,
+        main_positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        request_indices: torch.Tensor | None = None,
+    ) -> None:
+        self.model.prefill_main_ragged(
+            main_hidden,
+            main_positions,
+            query_start_loc,
+            valid_lengths,
+            request_indices=request_indices,
+        )
+
     def draft(
         self,
         input_ids: torch.Tensor,
@@ -888,6 +1038,7 @@ class DeepSeekV4DSpark(nn.Module):
         main_positions: torch.Tensor,
         *,
         store_main_kv: bool = True,
+        slot_index: torch.Tensor | None = None,
     ) -> torch.Tensor:
         draft_ids, _logits, confidence = self.model.draft(
             input_ids,
@@ -896,6 +1047,7 @@ class DeepSeekV4DSpark(nn.Module):
             self.lm_head,
             self.logits_processor,
             store_main_kv=store_main_kv,
+            slot_index=slot_index,
         )
         self._last_confidence = confidence
         return draft_ids
@@ -909,6 +1061,7 @@ class DeepSeekV4DSpark(nn.Module):
         return_logits: bool = True,
         return_confidence: bool = True,
         store_main_kv: bool = True,
+        slot_index: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         draft_ids, logits, confidence = self.model.draft(
             input_ids,
@@ -919,6 +1072,7 @@ class DeepSeekV4DSpark(nn.Module):
             return_logits=return_logits,
             return_confidence=return_confidence,
             store_main_kv=store_main_kv,
+            slot_index=slot_index,
         )
         return draft_ids, logits, confidence
 

@@ -6,6 +6,7 @@ from hashlib import sha256
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.model_executor.warmup import kernel_warmup
@@ -109,10 +110,23 @@ def test_dspark_uniform_decode_autotune_kwargs_skip_non_dspark() -> None:
     assert kernel_warmup._dspark_uniform_decode_autotune_kwargs(worker) == []
 
 
-def test_dspark_warmup_request_counts_cover_single_and_capped_multi() -> None:
+@pytest.mark.parametrize(
+    ("max_num_seqs", "expected"),
+    [
+        (1, (1,)),
+        (6, (1, 4, 6)),
+        (8, (1, 4, 8)),
+        (16, (1, 4, 8, 16)),
+    ],
+)
+def test_dspark_warmup_request_counts_cover_concurrency_lanes(
+    max_num_seqs: int,
+    expected: tuple[int, ...],
+) -> None:
     worker = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=8))
+    worker.scheduler_config.max_num_seqs = max_num_seqs
 
-    assert kernel_warmup._dspark_warmup_request_counts(worker) == (1, 4)
+    assert kernel_warmup._dspark_warmup_request_counts(worker) == expected
 
 
 def test_dspark_store_main_kv_warmup_seq_lens_cover_pruned_and_prefill() -> None:
@@ -145,6 +159,7 @@ def test_dspark_store_main_kv_warmup_uses_pruned_and_prefill_shapes(
     monkeypatch,
 ) -> None:
     calls = []
+    ragged_calls = []
     fake_module = ModuleType("vllm.models.deepseek_v4.nvidia.dspark_kernels")
 
     def fake_store(main_kv_cache, flat_kv, slots, **kwargs):
@@ -159,7 +174,28 @@ def test_dspark_store_main_kv_warmup_uses_pruned_and_prefill_shapes(
         )
         return main_kv_cache
 
+    def fake_store_ragged(
+        main_kv_cache,
+        flat_kv,
+        flat_positions,
+        query_start_loc,
+        valid_lengths,
+        **kwargs,
+    ):
+        ragged_calls.append(
+            (
+                tuple(main_kv_cache.shape),
+                tuple(flat_kv.shape),
+                tuple(flat_positions.shape),
+                tuple(query_start_loc.shape),
+                tuple(valid_lengths.shape),
+                kwargs.get("request_indices") is not None,
+            )
+        )
+        return main_kv_cache
+
     fake_module.dspark_store_main_kv = fake_store
+    fake_module.dspark_store_main_kv_ragged = fake_store_ragged
     monkeypatch.setitem(
         sys.modules,
         "vllm.models.deepseek_v4.nvidia.dspark_kernels",
@@ -195,6 +231,13 @@ def test_dspark_store_main_kv_warmup_uses_pruned_and_prefill_shapes(
         (False, True),
         (True, True),
     ]
+    assert len(ragged_calls) == len(seq_lens) * 2
+    assert [call[1][0] for call in ragged_calls[0::2]] == seq_lens
+    assert all(call[0] == (1, 128, 512) for call in ragged_calls)
+    assert all(call[2] == (call[1][0],) for call in ragged_calls)
+    assert all(call[3] == (2,) for call in ragged_calls)
+    assert all(call[4] == (1,) for call in ragged_calls)
+    assert [call[5] for call in ragged_calls[:2]] == [False, True]
 
 
 def test_spec_decode_padded_kernel_warmup_uses_dspark_query_width(
@@ -235,8 +278,13 @@ def test_spec_decode_padded_kernel_warmup_uses_dspark_query_width(
 
     kernel_warmup._deepseek_v4_spec_decode_padded_kernel_warmup(worker)
 
-    assert [call[0] for call in calls] == ["next", "inputs"]
-    next_call = calls[0]
+    assert [call[0] for call in calls] == ["next"] * 6 + ["inputs"]
+    for sample_width, call in enumerate(calls[:6], start=1):
+        assert call[1] == (1,)
+        assert call[2][0].shape == (1, sample_width)
+        assert call[2][5] == 129280
+        assert call[2][6] == sample_width
+    next_call = calls[5]
     assert next_call[1] == (1,)
     assert next_call[2][0].shape == (1, 6)
     assert next_call[2][0].tolist() == [[0, 0, 0, 0, 0, -1]]
@@ -244,7 +292,7 @@ def test_spec_decode_padded_kernel_warmup_uses_dspark_query_width(
     assert next_call[2][6] == 6
     assert next_call[3] == {"BLOCK_SIZE_TOKENS": 8}
 
-    inputs_call = calls[1]
+    inputs_call = calls[-1]
     assert inputs_call[1] == (1,)
     assert inputs_call[2][0].tolist() == [5]
     assert inputs_call[2][2].tolist() == [0, 6]
@@ -258,11 +306,14 @@ def test_b12x_route_pack_warmup_covers_dspark_short_shapes(
 
     host_mod = ModuleType("b12x.moe.fused.w4a16.host")
     host_mod.select_route_block_size_m = lambda tokens, topk, experts: 8
+    host_mod.max_packed_route_slots = lambda rows, block_size, experts: rows
 
     kernel_mod = ModuleType("b12x.moe.fused.w4a16.kernel")
 
-    def fake_pack(topk_ids, block_size, num_experts):
-        calls.append((tuple(topk_ids.shape), block_size, num_experts))
+    def fake_pack(topk_ids, block_size, num_experts, **kwargs):
+        calls.append(
+            (tuple(topk_ids.shape), block_size, num_experts, sorted(kwargs))
+        )
 
     kernel_mod.pack_topk_routes_by_expert = fake_pack
     monkeypatch.setitem(sys.modules, "b12x.moe.fused.w4a16.host", host_mod)
@@ -289,14 +340,23 @@ def test_b12x_route_pack_warmup_covers_dspark_short_shapes(
 
     kernel_warmup._deepseek_v4_b12x_route_pack_warmup(worker)
 
-    assert calls == [
-        ((6, 6), 8, 256),
-        ((20, 6), 8, 256),
-        ((32, 6), 8, 256),
-        ((512, 6), 8, 256),
-        ((513, 6), 8, 256),
-        ((1024, 6), 8, 256),
+    token_counts = kernel_warmup._dspark_route_pack_token_counts(worker)
+    expected_matrix_shapes = [
+        ((token_count, 6), 8, 256, []) for token_count in token_counts
     ]
+    expected_flat_shapes = [
+        ((token_count * 6,), 8, 256, []) for token_count in token_counts
+    ]
+    expected_output_kwargs = [
+        "block_expert_ids",
+        "expert_offsets",
+        "packed_route_count",
+        "packed_route_indices",
+    ]
+    assert len(calls) == len(token_counts) * 4
+    assert calls[0::4] == expected_matrix_shapes
+    assert [call[:3] + ([],) for call in calls[2::4]] == expected_flat_shapes
+    assert all(call[3] == expected_output_kwargs for call in calls[1::2])
 
 
 def test_rejection_sampler_warmup_uses_dspark_draft_width(

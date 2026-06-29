@@ -19,11 +19,14 @@ minutes (not the hours a full vLLM/CUDA build takes).
 
 The overlay files (the only fork sources baked into the image — changing any other file
 does **not** affect the image unless you add it to the Dockerfile's `COPY` list):
-`vllm/envs.py`, `vllm/config/speculative.py`, `vllm/model_executor/layers/fused_moe/b12x_moe.py`,
+`vllm/envs.py`, `vllm/compilation/cuda_graph.py`,
+`vllm/config/{cache,speculative}.py`, `vllm/utils/torch_utils.py`,
+`vllm/model_executor/layers/fused_moe/b12x_moe.py`,
 `vllm/model_executor/warmup/kernel_warmup.py`, `vllm/model_executor/models/registry.py`,
-`vllm/v1/outputs.py`, `vllm/v1/core/sched/scheduler.py`,
-`vllm/models/deepseek_v4/{__init__,nvidia/model,nvidia/sm120,nvidia/dspark,nvidia/dspark_kernels}.py`,
-`vllm/v1/attention/backends/registry.py`, `vllm/v1/attention/backends/mla/b12x_mla_sparse.py`,
+`vllm/v1/outputs.py`, `vllm/v1/kv_cache_interface.py`, `vllm/v1/core/sched/scheduler.py`,
+`vllm/models/deepseek_v4/{__init__,attention,nvidia/model,nvidia/sm120,nvidia/flashmla,nvidia/dspark,nvidia/dspark_kernels}.py`,
+`vllm/v1/attention/backends/registry.py`,
+`vllm/v1/attention/backends/mla/{flashmla_sparse,b12x_mla_sparse}.py`,
 `vllm/v1/spec_decode/{dspark,dspark_proposer,metrics}.py`,
 `vllm/v1/worker/gpu_model_runner.py`.
 

@@ -9,6 +9,25 @@ production branch.
 - DSpark draft attention now uses a first-pass Triton sparse-attention kernel
   over the small DSpark window. It is graph-safe and covered by reference tests,
   but it is not the reference TileLang kernel and is not yet fused or tuned.
+- 2026-06-29 request-stable DSpark main-KV slots now cover both write and
+  draft-read paths. Writes use the direct selected-row main-KV store kernel.
+  Draft reads pass the persistent slot tensor into the sparse-attention Triton
+  kernels, so graph-captured draft execution no longer needs a full
+  `index_select` copy of the 200k/1M KV row. The remaining shortcut is the
+  small CPU request-id to slot assignment map in the proposer; it is bounded by
+  `max_batch_size` and stale request IDs are reclaimed every step, but a
+  production scheduler could own this mapping more directly.
+- The `nvfp4_ds_mla` long-context lane is source-ported as Stage C only:
+  DeepSeek V4 keeps the padded 584-byte sparse-MLA envelope while routing
+  through the `nvfp4_ds_mla` dtype. This is isolated from the default 262k fp8
+  speed path and is not the unresolved true 416-byte compact NVFP4 kernel.
+  Runtime profile validation on 2026-06-29:
+  `1M/max_num_seqs=1` booted with `2,110,064` KV tokens and `2.01x`
+  full-1M concurrency; `1M/max_num_seqs=6` booted with `2,068,655` KV
+  tokens and `1.97x`; `200k/max_num_seqs=16` booted with `788,856` KV
+  tokens and `3.94x` full-200k concurrency. The mseq16 lane is therefore an
+  interactive-concurrency profile, not sixteen simultaneous full-window
+  requests.
 - The native sparse-attention path still does not reproduce the reference
   draft-side `act_quant` calls on KV activations. It should be compared
   numerically against the reference and folded into the final kernel path.
@@ -20,14 +39,14 @@ production branch.
   instead of participating in vLLM's normal KV-cache allocator. This matches the
   reference DSpark shape better, but it needs stronger reset/reorder handling for
   batching, preemption, and long-running mixed workloads.
-- The proposer now handles ragged mixed prefill+decode target batches by
-  grouping requests with equal target-context lengths and issuing compact
-  selected-row DSpark main-KV updates. This fixes the former uniform-reshape
-  crash and removes dummy placeholder projection work. The selected-row cache
-  write now uses a direct DSpark main-KV store kernel instead of
-  `index_select`/`index_copy_`, but the path still relies on Python grouping
-  and small CPU metadata reads. A production path should move grouping and
-  metadata handling closer to the scheduler/GPU execution layer.
+- The proposer now handles ragged mixed prefill+decode target batches with a
+  flat ragged DSpark main-KV store path. It passes GPU-resident
+  `query_start_loc`, valid lengths, flat positions, and persistent
+  request-slot indices into a Triton store kernel instead of grouping equal
+  lengths in Python. This clears the earlier dummy-padding and Python grouping
+  shortcut. Remaining shortcuts are small scalar boundary synchronizations for
+  validation, the CPU request-id to slot map, and a simple per-row request scan
+  inside the ragged store kernel rather than a scheduler-owned compact row map.
 - 2026-06-29 real-model c16 A/B: direct main-KV store measured
   `319.24 +/- 6.32` aggregate tok/s versus prior scheduler-off baseline
   `319.37 +/- 6.72` aggregate tok/s. This removes a correctness/overhead
@@ -38,10 +57,6 @@ production branch.
   kernel. This keeps first-run JIT and container-side tests deterministic, but
   should be revisited once kernels are fully precompiled or shipped with an
   explicit cache.
-- The ragged mixed-batch opt-in is still named `VLLM_DSPARK_MULTI_SEQ_PAD`
-  from the earlier placeholder-row implementation. It now enables ragged
-  grouping rather than padding, so rename it or leave an explicit compatibility
-  comment before this path graduates from experiment status.
 - `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1` is not part of the current
   concurrent benchmark config. Add a clear guard before combining that GPU-mask
   mode with ragged mixed prefill+decode batches, so future tests fail with an
@@ -165,6 +180,134 @@ production branch.
   `_build_prefill_chunk_metadata_kernel`, route packing,
   `eagle_prepare_next_token_padded_kernel`, `eagle_prepare_inputs_padded_kernel`,
   and `rejection_greedy_sample_kernel`.
+- 2026-06-29 community pull-back repeat: the derived 1M/NVFP4 repo no longer
+  has a major source change left to port wholesale. Its stable request-slot idea
+  is represented in our write and draft-read paths, and its Stage C
+  `nvfp4_ds_mla` launch lane is source-ported as isolated profiles. The latest
+  real-model c8 smoke on the current 262k/fp8 lane passed static c8
+  (`129.995` aggregate tok/s), staggered c8 (`126.810` aggregate tok/s), and a
+  grounded condense/churn test where the victim payload matched byte-for-byte
+  while `52` churn requests ran. The matched three-run single-stream baseline
+  was `63.019 +/- 0.970` server tok/s with `73.31%` draft acceptance and
+  `3.666` accepted tokens per draft. This proves the pull-back is correctness
+  neutral for single-stream speed; it does not satisfy the speed goal.
+- Warmup-route cleanup is not the next speed milestone. A narrow ragged
+  main-KV warmup exists and is unit-tested, but first-request JIT cleanup should
+  not displace target-verifier and draft graph/launch work unless a benchmark
+  shows it affects steady-state throughput.
+- 2026-06-29 draft-stream/bookkeeping overlap pass 1:
+  `VLLM_DSPARK_DRAFT_STREAM=1` enqueues DSpark proposal work on a dedicated
+  CUDA stream after rejection sampling and fences it with a CUDA event before
+  KV-connector finalization and the next default-stream use. This is not
+  draft/verify overlap. The next DSpark draft depends on the rejection
+  sampler's committed token and accepted target hidden row, so a full draft
+  graph cannot legally start before verifier logits/rejection without a
+  double-buffered optimistic branch. The implemented stream path can only hide
+  draft GPU work behind CPU bookkeeping/output work first; Nsight must verify
+  the timeline before promoting it beyond the experiment lane.
+- The same pass removes normal-path GPU scalar fences from DSpark target-context
+  batching by using `CommonAttentionMetadata.query_start_loc_cpu` for shape and
+  ragged/uniform decisions, while keeping GPU tensors for store kernels. GPU
+  rejected-count validation remains synchronization-free in throughput mode;
+  enable stage timing/diagnostics when debugging invalid metadata.
+- DSpark iteration timing now splits `target_postprocess_logits` into
+  `target_select_hidden` and `target_compute_logits`, and reports
+  `draft_propose_enqueue` / `draft_propose_fence` when the draft stream is
+  enabled. These timing modes still synchronize CUDA and must stay off for
+  throughput gates; use NVTX/PyTorch profiling scopes for timeline evidence.
+- 2026-06-29 DSpark flag-surface cleanup: the Docker control repo now has a
+  reduced 262k canonical speed preset and a flag matrix that separates
+  canonical flags, active experiments, diagnostics, settled-off toggles, and
+  isolated 1M/NVFP4 lanes. The forced-length curve wrapper now inherits the
+  env-file baseline instead of silently overriding `VLLM_USE_B12X_WO_PROJECTION`
+  back to `0`.
+- TODO P1: after overlap/scheduler experiments settle, fold more one-way
+  decisions into code defaults or narrow presets. Keep diagnostic and rejected
+  experiment flags available for reproduction, but stop carrying them in normal
+  speed-lane env files.
+- Keep `VLLM_DSPARK_DRAFT_STREAM=1` as the default DSpark evolution lane, not a
+  cleanup target. Even though the first safe pass measured only a modest speed
+  delta, it is the hook for the paper-aligned pipeline direction: earlier launch
+  points, stream/event fencing, and optimistic double-buffered drafts. Do not
+  call this production-stable until async lifecycle, request churn, and CUDA
+  graph stream-safety validation pass.
+- 2026-06-29 draft-stream/deferred-fence pass 2: async DSpark now leaves the
+  draft stream event pending across the `sample_tokens()` return instead of
+  fencing immediately, except for sync scheduling and KV-connector paths. The
+  next default-stream GPU consumers fence lazily before reading
+  `valid_sampled_token_count_gpu`, `prev_sampled_token_ids`, or `_draft_token_ids`;
+  `sample_tokens()` also fences before clearing/reusing draft state if a prior
+  draft was not consumed by the next input prep. This preserves tensor ordering
+  while overlapping the draft graph with engine scheduling and next-step CPU
+  preparation.
+- 2026-06-29 async lifecycle coverage added: unit tests now assert that a
+  pending DSpark draft event is waited before draft/proposer buffers are cleared
+  for reuse, explicit event fencing does not clear a newer pending event, and
+  next-iteration input-id paths fence before reading `_draft_token_ids` for
+  unchanged single-stream and reordered/churned survivor batches. These tests
+  are necessary but not sufficient for CUDA graph stream safety.
+- CUDA graph stream-safety risk remains open. `vllm/compilation/cuda_graph.py`
+  still uses the global graph pool and contains a TODO warning that shared graph
+  pools may be unsafe with multiple streams. DSpark draft graph replay now runs
+  on a dedicated stream, so keep Nsight stress validation on the gate before
+  treating `VLLM_DSPARK_DRAFT_STREAM=1` as production-stable.
+- The current target/draft dependency blocks full draft/verify overlap: the
+  released checkpoint consumes target layers `40,41,42` from a `43`-layer
+  target, and the integration exposes those rows after target forward. The
+  deferred-capture flag can reduce capture overhead for earlier taps, but layer
+  `42` still arrives at the verifier tail. Real overlap work therefore needs a
+  target-graph split/event at the DSpark feature write or must pivot to verifier
+  kernels/draft FULL-graph fusion for larger gains.
+- 2026-06-29 target-tail timing probe: with
+  `VLLM_DSPARK_ITER_TIMING=1` and `VLLM_DSPARK_STAGE_TIMING=1`, a real
+  1024-token single-stream run measured the legal post-target tail at only
+  `~3.0-3.1 ms` (`target_forward_done_to_draft_start`) while
+  `draft_propose` was `~11.8-11.9 ms` and the draft graph itself was
+  `~10.4-10.6 ms`. This confirms the current draft-stream path can only hide a
+  small target-logits/rejection/state-update tail unless the verifier graph is
+  split earlier at the DSpark feature write or an optimistic double-buffered
+  branch is added without mutating canonical KV before commit. Keep calling the
+  existing default path "draft stream / deferred fence / bookkeeping overlap",
+  not full draft/verify overlap.
+- 2026-06-29 single-stream input assembly direct-copy was tested and reverted.
+  Six 1024-token real-model runs averaged slower than the lazy-fence scatter
+  path, so the branch keeps the existing indexed assembly and only retains the
+  event-lifecycle safety tests.
+- 2026-06-29 request-stable slot pullback validation: focused clean-image
+  pytest selected-row/condense tests passed (`11 passed`), static c8 1024-token
+  smoke passed at `135.45` aggregate tok/s, staggered c8 1024-token smoke
+  passed at `130.65` aggregate tok/s, and the grounded condense victim matched
+  the expected payload byte-for-byte during churn. The three-run matched
+  single-stream benchmark measured `61.50 +/- 2.81` server tok/s versus the
+  prior fused-Markov checkpoint `61.75 +/- 3.52`, so the slot fix closes a
+  correctness gap without a measurable single-stream speed win.
+- 2026-06-29 flat ragged main-KV validation: focused clean-image pytest passed
+  on both head and worker (`10 passed`) including CPU reference and Triton
+  parity for `dspark_store_main_kv_ragged`. Real-model smoke with
+  `max_tokens=1024` passed static c8 (`131.64` aggregate tok/s), staggered c8
+  (`126.60` aggregate tok/s), and condense-victim churn (`byte_for_byte_match:
+  true`). The matched single-stream benchmark measured `63.46 +/- 1.56`
+  server tok/s, within the existing single-stream band. This removes Python
+  ragged grouping and selected-row cache-copy shortcuts, but it is not a
+  significant single-stream speed win.
+- 2026-06-29 post-ragged timing diagnostic: with opt-in synchronization timing
+  enabled, late cumulative single-stream averages over `230` iterations were
+  `target_forward=72.97ms`, `draft_propose=12.34ms`, and
+  `target_postprocess_logits=2.59ms` on the head rank; worker was effectively
+  identical. Proposer-stage timing showed `prefill_main=0.79ms`,
+  `draft=10.93ms`, and proposer `total=12.05ms`. This isolates target
+  verification as the next blocking term and confirms the main-KV/ragged path
+  is not the meaningful single-stream bottleneck.
+- 2026-06-29 target graph torch profile: a 1024-token single-stream profile on
+  the flat-ragged build collected both TP ranks. The largest kernel bucket was
+  target-side B12X W4A16 MoE (`~250ms` self CUDA per rank over the profiled
+  window), followed by dense fp8/fp4/BF16 GEMM buckets (`~58-93ms` each).
+  FlashInfer sparse MLA (`~8.5ms`) and MHC (`~15ms`) were much smaller, so the
+  next large single-stream custom-kernel target is verifier MoE/dense GEMM, not
+  sparse MLA/MHC first. Claude's review also flagged the sharper speed lever:
+  draft-stage wall time is about `12ms`, while the profiler shows much less
+  draft GPU work, so PIECEWISE graph/Python/launch/NCCL gaps in the draft path
+  need an Nsight Systems timeline before more draft micro-kernel work.
 
 ## Runtime Validation Notes
 
@@ -248,11 +391,14 @@ production branch.
 - TODO P1: add warmup coverage for inference-time JIT gaps observed on the real
   server: request-prep metadata, route packing, EAGLE-named speculative prep,
   and rejection greedy sampling.
-- TODO P1: replace the mixed prefill+decode Python grouping path and
-  selected-row bridge with a scheduler/GPU-native ragged `prefill_main` update
-  that preserves request row identity and avoids Python grouping. The
-  selected-row cache write itself is now direct-kernel based; the remaining
-  overhead is grouping, compact tensor construction, and launch fragmentation.
+- DONE 2026-06-29: replace the mixed prefill+decode Python grouping path and
+  selected-row bridge with a flat ragged `prefill_main` update. The proposer now
+  forwards GPU `query_start_loc`, valid lengths, positions, and request slots
+  to a Triton main-KV store kernel, and the draft-read path already consumes the
+  same request-stable slots. Remaining cleanup is scheduler-owned slot metadata,
+  eliminating small scalar validation syncs, and replacing the kernel's simple
+  per-row request scan with a lower-overhead row-to-request map if profiling
+  says it matters.
 - DONE 2026-06-29: validate `_dspark_store_main_kv_kernel` warmup on first real
   inference. The warmup pre-JITs no-reject, reject, request-index, and
   reject+request-index flag combinations. A fresh server start with image
@@ -261,6 +407,36 @@ production branch.
   any Triton JIT warning during inference on either node.
 - TODO P1: add FlashInfer sparse MLA tuning buckets for DSpark decode and graph
   capture shapes that currently fall back to tactic `-1`.
+- DONE 2026-06-29: profile the captured target-verifier graph with torch
+  profiler. Kernel rows point first at verifier MoE/dense GEMM buckets:
+  B12X W4A16 MoE `~250ms`, DeepGEMM fp8/fp4 `~93ms`, CUTLASS BF16/s1616
+  `~89ms`, and B12X dense GEMM `~58ms` per profiled window. Sparse MLA and MHC
+  are secondary in the single-stream trace.
+- DONE 2026-06-29: run an Nsight Systems CUDA-profiler-range timeline around
+  the draft path and full decode loop. The timeline shows the `~12ms` draft
+  term is mostly a real short CUDA graph replay, not just Python/index bridge:
+  short graphs average `~10.6ms`, long verifier graphs average `~61.2ms`, and
+  serialized graph pairs average `~71.8ms`. Graph launch gaps are only
+  `~4ms p50`, so PIECEWISE-to-FULL consolidation alone is not a `>25%` lever.
+  Artifacts are under
+  `experiments/dspark-benchmarks/profiles/draft_timeline_nsys_20260629_135000`
+  in the Docker/control repo.
+- TODO P1: run NCU on the target-side B12X W4A16 MoE and dense GEMM kernels at
+  the single-stream decode shape, then decide whether the next implementation
+  is tile/tactic tuning, a shape-specific kernel, or overlap.
+- TODO P1: prototype draft/verify overlap as the next parity-preserving
+  single-stream speed lever. Updated nsys bound: fully hiding the short
+  `~10.6ms` graph under the `~61.2ms` long verifier graph gives roughly a
+  `15-17%` ceiling before secondary gaps, so this is useful but probably not
+  enough by itself for the `>25%` speed gate.
+- TODO P1: target the long verifier graph for the next large single-stream win.
+  Nsys shows the long graph replay itself at `~61ms` per decode cycle, but its
+  child kernels are not reliably nested under the graph-trace rows. The
+  repeated CUTLASS BF16/s1616 kernel appears immediately after the long graph
+  and is likely target-logits projection (`~2.3ms` per verification step).
+  B12X/DeepGEMM buckets remain important from the torch profile, but do not
+  treat the raw nsys kernel table as direct proof that every bucket is inside
+  the decode long graph without an NCU graph-node follow-up.
 - TODO P1: implement a fused DSpark sparse-attention kernel that combines score
   calculation, sink-aware softmax denominator, and value accumulation without a
   materialized score buffer.
@@ -278,11 +454,47 @@ production branch.
   confidence aggregation across the fixed five-token DSpark block.
 - TODO P3: move confidence diagnostics and prefix-pruning decisions to a
   GPU-side/asynchronous metrics path.
-- TODO P3: port the derived 1M context padded `nvfp4_ds_mla` path as source
-  changes rather than Dockerfile text patches. Keep it as a separate launch
-  profile from the current 262k fp8 DSpark scheduler work, and validate with
-  `/v1/models` max length, KV-pool logs, short decode probes, and later a real
-  long-context retrieval/correctness prompt.
+- DONE 2026-06-29: source-port the derived 1M context padded
+  `nvfp4_ds_mla` path instead of Dockerfile text patching. The long-context
+  lane is isolated in the Docker/control presets and remains Stage C only:
+  DeepSeek V4 uses the padded 584-byte sparse-MLA envelope, not the unresolved
+  compact 416-byte NVFP4 kernel. Added focused tests that lock
+  `nvfp4_ds_mla` to `KVQuantMode.NVFP4`, verify DeepSeek V4 MLA page size is
+  `block_size * 584`, and verify the DeepSeek V4 FlashMLA cache shape is
+  `(num_blocks, block_size, 584)`.
+- DONE 2026-06-29: widen DSpark direct-store warmup request counts from
+  `(1, min(max_num_seqs, 4))` to cover the validated concurrency lanes
+  `(1, 4, 8, 16)` as available. This prevents the first c8/c16 request from
+  paying a live Triton compile for `store_main_kv` flag combinations after a
+  clean image rebuild.
+- DONE 2026-06-29: add a direct draft-read regression test for the condense
+  corruption mode. The test writes distinct persistent main-KV rows and asserts
+  `dspark_sparse_attention(..., request_indices=[2, 0])` reads the selected
+  request-stable rows rather than compact batch rows.
+- DONE 2026-06-29: isolate DSpark draft CUDA graph replay from the target
+  graph pool when `VLLM_DSPARK_DRAFT_STREAM=1`. The generic
+  `CUDAGraphWrapper` now accepts an explicit graph-pool override; DSpark uses a
+  dedicated pool only for draft-stream graph replay. This is correctness
+  groundwork for multi-stream overlap, not a standalone speed win. Validation:
+  focused graph-pool tests passed and full
+  `tests/v1/spec_decode/test_dspark.py` passed in a disposable runtime
+  container.
+- DONE 2026-06-29: split DSpark target-context projection from canonical
+  main-KV store. `DeepSeekV4DSpark.project_main_context()` is now a non-mutating
+  projection boundary, while `prefill_main_projected()` and
+  `prefill_main_ragged_projected()` perform the request-slot-stable KV writes.
+  The proposer records this as `prefill_project` before `prefill_main` in
+  stage timing and falls back to the old combined path if a model lacks the new
+  methods. This does not move work earlier yet and is not a throughput win by
+  itself; it creates the source-level boundary needed for a future stream/event
+  experiment or target feature-ready split without changing acceptance or
+  canonical cache semantics.
+- REVERTED 2026-06-29: removed the DSpark target-context preprojection stream
+  prototype after real-model A/B regressed single-stream throughput
+  (`52.65 +/- 1.25` tok/s with `max_tokens=1024`, versus recent controls in
+  the `~59-64` tok/s band). The non-mutating projection/store split remains,
+  but there is no active preprojection stream flag or projected-context side
+  path in the runner.
 
 - Implemented first pass: replace `DeepSeekV4DSparkAttention`'s PyTorch
   sparse-attention loop with a graph-safe native kernel for the serving decode

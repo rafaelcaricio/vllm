@@ -456,6 +456,16 @@ class GPUModelRunner(
         self._dspark_iter_timing_count = 0
         self._dspark_iter_timing_totals_ms: defaultdict[str, float] = defaultdict(float)
         self._dspark_iter_timing_started = 0.0
+        self._dspark_target_tail_timing_started = 0.0
+        self._dspark_draft_stream_requested = (
+            os.getenv("VLLM_DSPARK_DRAFT_STREAM", "0").lower()
+            in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        )
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -469,7 +479,27 @@ class GPUModelRunner(
                 "DSpark iteration timing enabled. CUDA is synchronized around "
                 "measured stages; use for diagnostics only."
             )
-
+        self._dspark_draft_stream_enabled = (
+            self._dspark_draft_stream_requested
+            and not self._dspark_iter_timing
+            and self.device.type == "cuda"
+        )
+        self._dspark_draft_stream: torch.cuda.Stream | None = None
+        self._dspark_draft_ready_event: torch.cuda.Event | None = None
+        self._dspark_draft_pending_event: torch.cuda.Event | None = None
+        if self._dspark_draft_stream_enabled:
+            self._dspark_draft_stream = torch.cuda.Stream()
+            self._dspark_draft_ready_event = torch.cuda.Event()
+            logger.info(
+                "DSpark draft stream enabled. Draft kernels are enqueued on a "
+                "dedicated CUDA stream and fenced with events before next-step "
+                "default-stream use."
+            )
+        elif self._dspark_draft_stream_requested and self._dspark_iter_timing:
+            logger.info(
+                "DSpark draft stream requested but disabled because iteration "
+                "timing synchronizes CUDA stages."
+            )
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
         )
@@ -1833,6 +1863,7 @@ class GPUModelRunner(
             # No requests in common with the previous iteration
             # So input_ids.cpu will have all the input ids.
             return
+        self._fence_pending_dspark_draft_stream()
         if common_indices_match and max_flattened_index == (num_common_tokens - 1):
             # Common-case optimization: the batch is unchanged
             # and no reordering happened.
@@ -2119,6 +2150,7 @@ class GPUModelRunner(
             and self.valid_sampled_token_count_gpu is not None
             and prev_req_id_to_index
         ):
+            self._fence_pending_dspark_draft_stream()
             self.prev_positions.copy_to_gpu(num_reqs)
             self.prev_num_draft_tokens.copy_to_gpu()
             cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
@@ -4170,9 +4202,15 @@ class GPUModelRunner(
             "execute_preprocess",
             "target_forward",
             "target_postprocess_logits",
+            "target_select_hidden",
+            "target_compute_logits",
             "sample_reject",
             "state_update",
+            "target_forward_done_to_draft_start",
             "draft_propose",
+            "draft_propose_enqueue",
+            "draft_propose_fence",
+            "draft_pending_fence",
             "bookkeeping",
             "finalize_output",
             "iter_total",
@@ -4186,6 +4224,20 @@ class GPUModelRunner(
             self._dspark_iter_timing_count,
             ", ".join(parts),
         )
+
+    def _mark_dspark_target_forward_done_for_tail_timing(self) -> None:
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_dspark()
+        ):
+            self._dspark_target_tail_timing_started = self._dspark_timing_start()
+
+    def _record_dspark_target_tail_to_draft_start(self) -> None:
+        started = self._dspark_target_tail_timing_started
+        if started == 0.0:
+            return
+        self._dspark_timing_record("target_forward_done_to_draft_start", started)
+        self._dspark_target_tail_timing_started = 0.0
 
     @torch.inference_mode()
     def execute_model(
@@ -4477,6 +4529,7 @@ class GPUModelRunner(
                 **model_kwargs,
             )
         self._dspark_timing_record("target_forward", stage_started)
+        self._mark_dspark_target_forward_done_for_tail_timing()
 
         stage_started = self._dspark_timing_start()
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
@@ -4506,13 +4559,35 @@ class GPUModelRunner(
                         kv_connector_output,
                     )
 
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                substage_started = self._dspark_timing_start()
+                with record_function_or_nullcontext(
+                    "gpu_model_runner: dspark target_select_hidden"
+                ):
+                    sample_hidden_states = hidden_states[logits_indices]
+                self._dspark_timing_record(
+                    "target_select_hidden", substage_started
+                )
+
+                substage_started = self._dspark_timing_start()
+                with record_function_or_nullcontext(
+                    "gpu_model_runner: dspark target_compute_logits"
+                ):
+                    logits = self.model.compute_logits(sample_hidden_states)
+                self._dspark_timing_record(
+                    "target_compute_logits", substage_started
+                )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
 
-                sample_hidden_states = hidden_states[logits_indices]
+                substage_started = self._dspark_timing_start()
+                with record_function_or_nullcontext(
+                    "gpu_model_runner: dspark target_select_hidden"
+                ):
+                    sample_hidden_states = hidden_states[logits_indices]
+                self._dspark_timing_record(
+                    "target_select_hidden", substage_started
+                )
                 if not get_pp_group().is_last_rank:
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(
@@ -4526,7 +4601,14 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                    substage_started = self._dspark_timing_start()
+                    with record_function_or_nullcontext(
+                        "gpu_model_runner: dspark target_compute_logits"
+                    ):
+                        logits = self.model.compute_logits(sample_hidden_states)
+                    self._dspark_timing_record(
+                        "target_compute_logits", substage_started
+                    )
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -4627,23 +4709,16 @@ class GPUModelRunner(
                 )
         self._dspark_timing_record("state_update", stage_started)
 
-        self._draft_token_ids = None
-        self._draft_token_lengths_cpu = None
-        self._draft_token_length_req_ids = None
-        self._draft_probs = None
-        self._draft_prob_req_ids = None
-        self._draft_confidence = None
-        self._draft_confidence_req_ids = None
-        self._draft_raw_confidence = None
-        self._draft_raw_confidence_req_ids = None
-        self._draft_token_req_ids = None
-        self.valid_sampled_token_count_gpu = None
-        self.input_batch.prev_sampled_token_ids = None
+        self._clear_dspark_draft_state_after_pending_fence()
+        dspark_draft_ready_event: torch.cuda.Event | None = None
 
         def propose_draft_token_ids(sampled_token_ids):
+            nonlocal dspark_draft_ready_event
             assert spec_decode_common_attn_metadata is not None
+            self._record_dspark_target_tail_to_draft_start()
             stage_started = self._dspark_timing_start()
-            with record_function_or_nullcontext("gpu_model_runner: draft"):
+
+            def run_draft_proposal() -> None:
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
                     sampled_token_ids,
@@ -4656,7 +4731,46 @@ class GPUModelRunner(
                     slot_mappings,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
-            self._dspark_timing_record("draft_propose", stage_started)
+
+            draft_stream = self._dspark_draft_stream
+            draft_ready_event = self._dspark_draft_ready_event
+            if (
+                self._dspark_draft_stream_enabled
+                and draft_stream is not None
+                and draft_ready_event is not None
+            ):
+                default_stream = torch.cuda.current_stream()
+                with (
+                    torch.cuda.stream(draft_stream),
+                    record_function_or_nullcontext(
+                        "gpu_model_runner: dspark draft_stream_enqueue"
+                    ),
+                ):
+                    draft_stream.wait_stream(default_stream)
+                    run_draft_proposal()
+                    draft_ready_event.record(draft_stream)
+                dspark_draft_ready_event = draft_ready_event
+                self._dspark_draft_pending_event = draft_ready_event
+                self._dspark_timing_record("draft_propose_enqueue", stage_started)
+            else:
+                with record_function_or_nullcontext("gpu_model_runner: draft"):
+                    run_draft_proposal()
+                self._dspark_timing_record("draft_propose", stage_started)
+
+        def fence_dspark_draft_stream() -> None:
+            nonlocal dspark_draft_ready_event
+            if dspark_draft_ready_event is None:
+                return
+            stage_started = self._dspark_timing_start()
+            with record_function_or_nullcontext(
+                "gpu_model_runner: dspark draft_stream_fence"
+            ):
+                self._fence_pending_dspark_draft_stream(
+                    dspark_draft_ready_event,
+                    timing_name=None,
+                )
+            dspark_draft_ready_event = None
+            self._dspark_timing_record("draft_propose_fence", stage_started)
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
@@ -4766,10 +4880,13 @@ class GPUModelRunner(
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
+        if not self.use_async_scheduling or has_kv_transfer_group():
+            fence_dspark_draft_stream()
+
         stage_started = self._dspark_timing_start()
-        # Finalize KV connector (wait_for_save + clear metadata) after
-        # draft model runs. Deferred from target model forward to allow
-        # draft model to also save its KV cache.
+        # Finalize KV connector (wait_for_save + clear metadata). Connector
+        # paths still fence the draft stream first; normal async DSpark leaves
+        # the draft event pending and fences lazily at the next GPU consumer.
         if spec_config is not None:
             self.finalize_kv_connector()
 
@@ -4920,6 +5037,45 @@ class GPUModelRunner(
             self.input_batch.is_token_ids[i, pos] = True
             self.input_batch.num_tokens_no_spec[i] = pos + 1
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+
+    def _fence_pending_dspark_draft_stream(
+        self,
+        event: torch.cuda.Event | None = None,
+        *,
+        timing_name: str | None = "draft_pending_fence",
+    ) -> None:
+        pending_event = event if event is not None else self._dspark_draft_pending_event
+        if pending_event is None:
+            return
+        stage_started = self._dspark_timing_start() if timing_name else 0.0
+        with record_function_or_nullcontext(
+            "gpu_model_runner: dspark draft_stream_pending_fence"
+        ):
+            torch.cuda.current_stream().wait_event(pending_event)
+        if self._dspark_draft_pending_event is pending_event:
+            self._dspark_draft_pending_event = None
+        if timing_name is not None:
+            self._dspark_timing_record(timing_name, stage_started)
+
+    def _clear_dspark_draft_state_after_pending_fence(self) -> None:
+        # A previous async DSpark proposal may have been left pending so it can
+        # overlap CPU bookkeeping and scheduler preparation. If the next input
+        # prep did not consume that proposal, wait before clearing/reusing draft
+        # state and proposer-owned buffers.
+        self._fence_pending_dspark_draft_stream()
+
+        self._draft_token_ids = None
+        self._draft_token_lengths_cpu = None
+        self._draft_token_length_req_ids = None
+        self._draft_probs = None
+        self._draft_prob_req_ids = None
+        self._draft_confidence = None
+        self._draft_confidence_req_ids = None
+        self._draft_raw_confidence = None
+        self._draft_raw_confidence_req_ids = None
+        self._draft_token_req_ids = None
+        self.valid_sampled_token_count_gpu = None
+        self.input_batch.prev_sampled_token_ids = None
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
@@ -5240,7 +5396,11 @@ class GPUModelRunner(
                 if spec_config.use_dspark()
                 else "get_mtp_target_hidden_states"
             )
-            alt = getattr(self.get_model(), target_hidden_getter_name, lambda: None)()
+            alt = getattr(
+                self.get_model(),
+                target_hidden_getter_name,
+                lambda: None,
+            )()
             if alt is not None:
                 hidden_states = alt
 
@@ -5304,6 +5464,9 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
+            dspark_kwargs = {}
+            if spec_config.use_dspark():
+                dspark_kwargs = {"req_ids": self.input_batch.req_ids.copy()}
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -5315,6 +5478,7 @@ class GPUModelRunner(
                 mm_embed_inputs=mm_embed_inputs,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
+                **dspark_kwargs,
             )
             if hasattr(self.drafter, "take_last_draft_probs"):
                 draft_probs = self.drafter.take_last_draft_probs()
