@@ -4,7 +4,10 @@
 import sys
 from hashlib import sha256
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+
+import pytest
+import torch
 
 from vllm.model_executor.warmup import kernel_warmup
 
@@ -58,3 +61,343 @@ def test_resolve_flashinfer_autotune_file_uses_override_dir(
     path = kernel_warmup._resolve_flashinfer_autotune_file(runner)
 
     assert path == tmp_path / cache_hash / "autotune_configs.json"
+
+
+def test_dspark_uniform_decode_autotune_kwargs_cover_logged_shapes() -> None:
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="dspark",
+                num_speculative_tokens=5,
+            )
+        ),
+        model_runner=SimpleNamespace(max_num_tokens=8192, max_model_len=262144),
+    )
+
+    kwargs = kernel_warmup._dspark_uniform_decode_autotune_kwargs(worker)
+
+    assert kwargs == [
+        {
+            "num_tokens": 6,
+            "skip_eplb": True,
+            "is_profile": True,
+            "force_attention": True,
+            "uniform_decode": True,
+            "profile_seq_lens": 512,
+        },
+        {
+            "num_tokens": 6,
+            "skip_eplb": True,
+            "is_profile": True,
+            "force_attention": True,
+            "uniform_decode": True,
+            "profile_seq_lens": 2048,
+        },
+    ]
+
+
+def test_dspark_uniform_decode_autotune_kwargs_skip_non_dspark() -> None:
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="mtp",
+                num_speculative_tokens=5,
+            )
+        ),
+        model_runner=SimpleNamespace(max_num_tokens=8192, max_model_len=262144),
+    )
+
+    assert kernel_warmup._dspark_uniform_decode_autotune_kwargs(worker) == []
+
+
+@pytest.mark.parametrize(
+    ("max_num_seqs", "expected"),
+    [
+        (1, (1,)),
+        (6, (1, 4, 6)),
+        (8, (1, 4, 8)),
+        (16, (1, 4, 8, 16)),
+    ],
+)
+def test_dspark_warmup_request_counts_cover_concurrency_lanes(
+    max_num_seqs: int,
+    expected: tuple[int, ...],
+) -> None:
+    worker = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=8))
+    worker.scheduler_config.max_num_seqs = max_num_seqs
+
+    assert kernel_warmup._dspark_warmup_request_counts(worker) == expected
+
+
+def test_dspark_store_main_kv_warmup_seq_lens_cover_pruned_and_prefill() -> None:
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="dspark",
+                num_speculative_tokens=5,
+            )
+        ),
+        model_runner=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(sliding_window=128)
+            )
+        ),
+    )
+
+    assert kernel_warmup._dspark_store_main_kv_warmup_seq_lens(worker) == (
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        128,
+    )
+
+
+def test_dspark_store_main_kv_warmup_uses_pruned_and_prefill_shapes(
+    monkeypatch,
+) -> None:
+    calls = []
+    ragged_calls = []
+    fake_module = ModuleType("vllm.models.deepseek_v4.nvidia.dspark_kernels")
+
+    def fake_store(main_kv_cache, flat_kv, slots, **kwargs):
+        calls.append(
+            (
+                tuple(main_kv_cache.shape),
+                tuple(flat_kv.shape),
+                tuple(slots.shape),
+                kwargs.get("num_rejected_tokens") is not None,
+                kwargs.get("request_indices") is not None,
+            )
+        )
+        return main_kv_cache
+
+    def fake_store_ragged(
+        main_kv_cache,
+        flat_kv,
+        flat_positions,
+        query_start_loc,
+        valid_lengths,
+        **kwargs,
+    ):
+        ragged_calls.append(
+            (
+                tuple(main_kv_cache.shape),
+                tuple(flat_kv.shape),
+                tuple(flat_positions.shape),
+                tuple(query_start_loc.shape),
+                tuple(valid_lengths.shape),
+                kwargs.get("request_indices") is not None,
+            )
+        )
+        return main_kv_cache
+
+    fake_module.dspark_store_main_kv = fake_store
+    fake_module.dspark_store_main_kv_ragged = fake_store_ragged
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.models.deepseek_v4.nvidia.dspark_kernels",
+        fake_module,
+    )
+
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="dspark",
+                num_speculative_tokens=5,
+            )
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        model_runner=SimpleNamespace(
+            device=torch.device("cpu"),
+            dtype=torch.bfloat16,
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(head_dim=512, sliding_window=128)
+            ),
+        ),
+    )
+
+    kernel_warmup._deepseek_v4_dspark_store_main_kv_warmup(worker)
+
+    seq_lens = [call[1][1] for call in calls[0::4]]
+    assert seq_lens == [1, 2, 3, 4, 5, 6, 128]
+    assert all(call[0] == (1, 128, 512) for call in calls)
+    assert all(call[2] == (1, call[1][1]) for call in calls)
+    assert [(call[3], call[4]) for call in calls[:4]] == [
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ]
+    assert len(ragged_calls) == len(seq_lens) * 2
+    assert [call[1][0] for call in ragged_calls[0::2]] == seq_lens
+    assert all(call[0] == (1, 128, 512) for call in ragged_calls)
+    assert all(call[2] == (call[1][0],) for call in ragged_calls)
+    assert all(call[3] == (2,) for call in ragged_calls)
+    assert all(call[4] == (1,) for call in ragged_calls)
+    assert [call[5] for call in ragged_calls[:2]] == [False, True]
+
+
+def test_spec_decode_padded_kernel_warmup_uses_dspark_query_width(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class FakeKernel:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append((self.name, grid, args, kwargs))
+                if self.name == "next":
+                    args[4].fill_(5)
+
+            return launch
+
+    monkeypatch.setattr(
+        kernel_warmup,
+        "_spec_decode_padded_warmup_kernels",
+        lambda: (FakeKernel("next"), FakeKernel("inputs")),
+    )
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="dspark",
+                num_speculative_tokens=5,
+            )
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        model_runner=SimpleNamespace(
+            device=torch.device("cpu"),
+            model_config=SimpleNamespace(get_vocab_size=lambda: 129280),
+        ),
+    )
+
+    kernel_warmup._deepseek_v4_spec_decode_padded_kernel_warmup(worker)
+
+    assert [call[0] for call in calls] == ["next"] * 6 + ["inputs"]
+    for sample_width, call in enumerate(calls[:6], start=1):
+        assert call[1] == (1,)
+        assert call[2][0].shape == (1, sample_width)
+        assert call[2][5] == 129280
+        assert call[2][6] == sample_width
+    next_call = calls[5]
+    assert next_call[1] == (1,)
+    assert next_call[2][0].shape == (1, 6)
+    assert next_call[2][0].tolist() == [[0, 0, 0, 0, 0, -1]]
+    assert next_call[2][5] == 129280
+    assert next_call[2][6] == 6
+    assert next_call[3] == {"BLOCK_SIZE_TOKENS": 8}
+
+    inputs_call = calls[-1]
+    assert inputs_call[1] == (1,)
+    assert inputs_call[2][0].tolist() == [5]
+    assert inputs_call[2][2].tolist() == [0, 6]
+    assert inputs_call[2][5] == 1
+
+
+def test_b12x_route_pack_warmup_covers_dspark_short_shapes(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    host_mod = ModuleType("b12x.moe.fused.w4a16.host")
+    host_mod.select_route_block_size_m = lambda tokens, topk, experts: 8
+    host_mod.max_packed_route_slots = lambda rows, block_size, experts: rows
+
+    kernel_mod = ModuleType("b12x.moe.fused.w4a16.kernel")
+
+    def fake_pack(topk_ids, block_size, num_experts, **kwargs):
+        calls.append(
+            (tuple(topk_ids.shape), block_size, num_experts, sorted(kwargs))
+        )
+
+    kernel_mod.pack_topk_routes_by_expert = fake_pack
+    monkeypatch.setitem(sys.modules, "b12x.moe.fused.w4a16.host", host_mod)
+    monkeypatch.setitem(sys.modules, "b12x.moe.fused.w4a16.kernel", kernel_mod)
+
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="dspark",
+                num_speculative_tokens=5,
+            )
+        ),
+        model_runner=SimpleNamespace(
+            device=torch.device("cpu"),
+            max_num_tokens=8192,
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(
+                    n_routed_experts=256,
+                    num_experts_per_tok=6,
+                )
+            ),
+        ),
+    )
+
+    kernel_warmup._deepseek_v4_b12x_route_pack_warmup(worker)
+
+    token_counts = kernel_warmup._dspark_route_pack_token_counts(worker)
+    expected_matrix_shapes = [
+        ((token_count, 6), 8, 256, []) for token_count in token_counts
+    ]
+    expected_flat_shapes = [
+        ((token_count * 6,), 8, 256, []) for token_count in token_counts
+    ]
+    expected_output_kwargs = [
+        "block_expert_ids",
+        "expert_offsets",
+        "packed_route_count",
+        "packed_route_indices",
+    ]
+    assert len(calls) == len(token_counts) * 4
+    assert calls[0::4] == expected_matrix_shapes
+    assert [call[:3] + ([],) for call in calls[2::4]] == expected_flat_shapes
+    assert all(call[3] == expected_output_kwargs for call in calls[1::2])
+
+
+def test_rejection_sampler_warmup_uses_dspark_draft_width(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append((grid, args, kwargs))
+
+            return launch
+
+    import vllm.v1.sample.rejection_sampler as rejection_sampler
+
+    monkeypatch.setattr(
+        rejection_sampler, "rejection_greedy_sample_kernel", FakeKernel()
+    )
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                method="dspark",
+                num_speculative_tokens=5,
+            )
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+        model_runner=SimpleNamespace(device=torch.device("cpu")),
+    )
+
+    kernel_warmup._deepseek_v4_rejection_sampler_warmup(worker)
+
+    assert len(calls) == 1
+    grid, args, kwargs = calls[0]
+    assert grid == (1,)
+    assert args[0].shape == (1, 6)
+    assert args[1].tolist() == [5]
+    assert args[2].shape == (5,)
+    assert args[3].dtype == torch.int64
+    assert args[5] is None
+    assert args[6] == 5
+    assert args[7] is None
+    assert args[8] is None
+    assert kwargs == {"SYNTHETIC_MODE": False}

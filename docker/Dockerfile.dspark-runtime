@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+FROM ghcr.io/bjk110/vllm-spark:unholy-fusion-prod-ready
+
+ARG VLLM_SITE=/opt/env/lib/python3.12/site-packages/vllm
+
+COPY vllm/envs.py ${VLLM_SITE}/envs.py
+COPY vllm/config/speculative.py ${VLLM_SITE}/config/speculative.py
+COPY vllm/model_executor/layers/fused_moe/b12x_moe.py ${VLLM_SITE}/model_executor/layers/fused_moe/b12x_moe.py
+COPY vllm/model_executor/warmup/kernel_warmup.py ${VLLM_SITE}/model_executor/warmup/kernel_warmup.py
+COPY vllm/model_executor/models/registry.py ${VLLM_SITE}/model_executor/models/registry.py
+COPY vllm/v1/outputs.py ${VLLM_SITE}/v1/outputs.py
+COPY vllm/v1/core/sched/scheduler.py ${VLLM_SITE}/v1/core/sched/scheduler.py
+COPY vllm/models/deepseek_v4/__init__.py ${VLLM_SITE}/models/deepseek_v4/__init__.py
+COPY vllm/models/deepseek_v4/nvidia/model.py ${VLLM_SITE}/models/deepseek_v4/nvidia/model.py
+COPY vllm/models/deepseek_v4/nvidia/dspark.py ${VLLM_SITE}/models/deepseek_v4/nvidia/dspark.py
+COPY vllm/models/deepseek_v4/nvidia/dspark_kernels.py ${VLLM_SITE}/models/deepseek_v4/nvidia/dspark_kernels.py
+COPY vllm/v1/spec_decode/dspark.py ${VLLM_SITE}/v1/spec_decode/dspark.py
+COPY vllm/v1/spec_decode/dspark_proposer.py ${VLLM_SITE}/v1/spec_decode/dspark_proposer.py
+COPY vllm/v1/worker/gpu_model_runner.py ${VLLM_SITE}/v1/worker/gpu_model_runner.py

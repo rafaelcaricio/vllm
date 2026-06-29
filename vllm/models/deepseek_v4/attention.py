@@ -250,6 +250,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.ln_events = [torch.cuda.Event() for _ in range(4)]
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
+        if cache_config.cache_dtype in ("nvfp4", "nvfp4_ds_mla"):
+            # Stage C long-context lane: keep DeepSeek V4's known-good sparse
+            # MLA cache envelope while routing through the nvfp4_ds_mla dtype.
+            head_bytes = 584
         self.swa_cache_layer = DeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,
@@ -890,16 +894,29 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         else:
             self._sparse_mla_wrapper = None
 
-        # DeepseekV4 only supports fp8 kv-cache format for now.
+        # DeepseekV4 sparse MLA supports fp8 by default and an opt-in padded
+        # nvfp4_ds_mla long-context lane.
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
 
-        assert kv_cache_dtype.startswith("fp8"), (
-            f"DeepseekV4 only supports fp8 kv-cache format for now, "
+        assert (
+            kv_cache_dtype.startswith("fp8")
+            or kv_cache_dtype in ("nvfp4", "nvfp4_ds_mla")
+        ), (
+            f"DeepseekV4 only supports fp8/nvfp4_ds_mla kv-cache format for now, "
             f"got {kv_cache_dtype}"
         )
         assert issubclass(self.get_attn_backend(), FlashMLASparseBackend), (
             "Only FlashMLA Sparse Attention backend is supported for DeepseekV4 for now"
         )
+        if (
+            issubclass(self.get_attn_backend(), FlashMLASparseBackend)
+            and kv_cache_dtype in ("nvfp4", "nvfp4_ds_mla")
+        ):
+            assert cache_config is not None
+            cache_config.cache_dtype = "nvfp4_ds_mla"
+            kv_cache_dtype = "nvfp4_ds_mla"
+            logger.info_once("Using DeepSeek V4 padded nvfp4_ds_mla KV cache format.")
+
         # FlashMLA Sparse Attention fp8 backend uses "fp8_ds_mla" kv-cache format
         # Automatically convert fp8 kv-cache format to "fp8_ds_mla"
         if (

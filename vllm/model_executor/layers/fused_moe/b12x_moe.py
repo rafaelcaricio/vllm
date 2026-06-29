@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """B12X modular fused-MoE backend for DeepSeek V4 native MXFP4 weights."""
 
+from collections.abc import Callable
 from typing import Any, cast
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
@@ -22,6 +25,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 
 def _dtype_element_size(dtype: torch.dtype) -> int:
@@ -166,7 +171,166 @@ def _b12x_activation_name(activation: MoEActivation) -> str:
     return activation.value
 
 
+def _parse_b12x_w4a16_tile_config() -> tuple[int, int, int] | None:
+    raw_config = str(envs.VLLM_B12X_W4A16_FORCE_TILE_CONFIG).strip()
+    if not raw_config:
+        return None
+    parts = [part.strip() for part in raw_config.split(",")]
+    if len(parts) != 3:
+        raise ValueError(
+            "VLLM_B12X_W4A16_FORCE_TILE_CONFIG must be "
+            "TILE_K,TILE_N,CTA_THREADS, got "
+            f"{raw_config!r}"
+        )
+    return tuple(int(part) for part in parts)
+
+
+def _forced_b12x_w4a16_tile_blocks_per_sm(
+    w4a16_kernel: Any,
+    kwargs: dict[str, Any],
+    tile_config: tuple[int, int, int],
+) -> int | None:
+    required_names = (
+        "problem_m",
+        "problem_n",
+        "problem_k",
+        "top_k",
+        "moe_block_size",
+        "sms",
+        "max_shared_mem",
+    )
+    if any(name not in kwargs for name in required_names):
+        return None
+
+    tile_k, tile_n, cta_threads = tile_config
+    try:
+        cta_m_blocks = w4a16_kernel._covering_count(int(kwargs["moe_block_size"]), 16)
+        tile_fits = w4a16_kernel._candidate_tile_fits(
+            problem_n=int(kwargs["problem_n"]),
+            problem_k=int(kwargs["problem_k"]),
+            cta_m_blocks=cta_m_blocks,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            cta_threads=cta_threads,
+            max_shared_mem=int(kwargs["max_shared_mem"]) - 512,
+            scale_format=kwargs.get("scale_format", "e4m3_k16"),
+        )
+    except Exception:
+        return None
+    if not tile_fits:
+        return None
+
+    try:
+        return int(
+            w4a16_kernel._determine_blocks_per_sm(
+                problem_m=int(kwargs["problem_m"]),
+                problem_n=int(kwargs["problem_n"]),
+                top_k=int(kwargs["top_k"]),
+                cta_threads=cta_threads,
+                cta_m_blocks=cta_m_blocks,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                uses_m_block_8=int(kwargs["moe_block_size"]) == 8,
+                sms=int(kwargs["sms"]),
+                max_shared_mem=int(kwargs["max_shared_mem"]),
+                scale_format=kwargs.get("scale_format", "e4m3_k16"),
+            )
+        )
+    except Exception:
+        return None
+
+
+def _maybe_apply_b12x_w4a16_selector_override() -> None:
+    forced_blocks_per_sm = int(envs.VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM)
+    forced_tile_config = _parse_b12x_w4a16_tile_config()
+    max_problem_m = int(envs.VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M)
+    if forced_blocks_per_sm < 0:
+        raise ValueError(
+            "VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM must be >= 0, got "
+            f"{forced_blocks_per_sm}"
+        )
+    if max_problem_m < 0:
+        raise ValueError(
+            f"VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M must be >= 0, got {max_problem_m}"
+        )
+    if forced_blocks_per_sm == 0 and forced_tile_config is None:
+        return
+
+    try:
+        from b12x.moe.fused.w4a16 import kernel as w4a16_kernel
+    except Exception:
+        logger.warning(
+            "Could not install B12X W4A16 MoE selector override; b12x "
+            "kernel module is unavailable.",
+            exc_info=True,
+        )
+        return
+
+    original_attr = "_vllm_original_select_tile_config"
+    if hasattr(w4a16_kernel, original_attr):
+        return
+
+    original_select_tile_config = getattr(w4a16_kernel, "_select_tile_config", None)
+    if not callable(original_select_tile_config):
+        logger.warning(
+            "Could not install B12X W4A16 MoE selector override; "
+            "_select_tile_config is missing."
+        )
+        return
+    setattr(w4a16_kernel, original_attr, original_select_tile_config)
+
+    def _vllm_select_tile_config(
+        *args: Any, **kwargs: Any
+    ) -> tuple[int, int, int, int]:
+        selected = original_select_tile_config(*args, **kwargs)
+        if len(selected) != 4:
+            return selected
+        tile_k, tile_n, cta_threads, _blocks_per_sm = selected
+        problem_m = kwargs.get("problem_m")
+        if problem_m is None:
+            return selected
+        active_max_problem_m = int(envs.VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M)
+        if active_max_problem_m > 0 and int(problem_m) > active_max_problem_m:
+            return selected
+        active_tile_config = _parse_b12x_w4a16_tile_config()
+        if active_tile_config is not None:
+            forced_tile_blocks_per_sm = _forced_b12x_w4a16_tile_blocks_per_sm(
+                w4a16_kernel,
+                kwargs,
+                active_tile_config,
+            )
+            if forced_tile_blocks_per_sm is not None:
+                tile_k, tile_n, cta_threads = active_tile_config
+                selected = (
+                    tile_k,
+                    tile_n,
+                    cta_threads,
+                    forced_tile_blocks_per_sm,
+                )
+        active_forced_blocks_per_sm = int(envs.VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM)
+        if active_forced_blocks_per_sm <= 0:
+            return selected
+        tile_k, tile_n, cta_threads, _blocks_per_sm = selected
+        return tile_k, tile_n, cta_threads, active_forced_blocks_per_sm
+
+    w4a16_kernel._select_tile_config = cast(
+        Callable[..., tuple[int, int, int, int]], _vllm_select_tile_config
+    )
+    logger.info(
+        "Enabled B12X W4A16 MoE selector override: preserving selected tile "
+        "unless a tile is forced, tile_config=%s, blocks_per_sm=%d, "
+        "problem_m<=%d",
+        forced_tile_config,
+        forced_blocks_per_sm,
+        max_problem_m,
+    )
+
+
+_maybe_apply_b12x_w4a16_selector_override()
+
+
 def _prepare_b12x_fp4_moe_weights(**kwargs):
+    _maybe_apply_b12x_w4a16_selector_override()
     from b12x.integration import prepare_b12x_fp4_moe_weights
 
     return prepare_b12x_fp4_moe_weights(**kwargs)
@@ -491,15 +655,19 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         if prepared_w4a16 is None:
             weight_E = int(local_num_experts)
             n = max(int(N) // 2, 1)
-            device = torch.device(
-                "cuda", torch.cuda.current_device()
-            ) if torch.cuda.is_available() else torch.device("cpu")
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
         else:
             weight_E = int(prepared_w4a16.num_experts)
             n = int(prepared_w4a16.intermediate_size)
             w13 = getattr(prepared_w4a16, "w13", None)
-            device = w13.device if isinstance(w13, torch.Tensor) else torch.device(
-                "cuda", torch.cuda.current_device()
+            device = (
+                w13.device
+                if isinstance(w13, torch.Tensor)
+                else torch.device("cuda", torch.cuda.current_device())
             )
         workspace_dtype = getattr(self.moe_config, "in_dtype", torch.bfloat16)
         plan = _plan_b12x_moe_fp4_scratch(

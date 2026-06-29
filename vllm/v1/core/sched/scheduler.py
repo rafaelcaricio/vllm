@@ -3,7 +3,7 @@
 import itertools
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -1293,6 +1293,8 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        draft_token_lengths = model_runner_output.draft_token_lengths
+        dspark_confidence = model_runner_output.dspark_confidence
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1389,6 +1391,11 @@ class Scheduler(SchedulerInterface):
                     num_accepted_tokens=num_accepted,
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
+                    dspark_confidence=(
+                        dspark_confidence.get(req_id)
+                        if dspark_confidence is not None
+                        else None
+                    ),
                 )
 
             # Free encoder inputs only after the step has actually executed.
@@ -1483,6 +1490,18 @@ class Scheduler(SchedulerInterface):
                     stopped_running_reqs.add(request)
                 else:
                     stopped_preempted_reqs.add(request)
+            elif (
+                draft_token_lengths is not None
+                and self.scheduler_config.async_scheduling
+            ):
+                # Async speculative scheduling normally installs a fixed
+                # placeholder list before the worker proposes the next draft.
+                # DSpark can produce a shorter confidence-scheduled prefix, so
+                # resize the placeholder list here for the next scheduler step.
+                draft_len = draft_token_lengths.get(req_id)
+                if draft_len is not None:
+                    draft_len = max(0, min(int(draft_len), self.num_spec_tokens))
+                    request.spec_token_ids = [-1] * draft_len
 
             # Extract sample logprobs if needed.
             if (
@@ -2018,6 +2037,7 @@ class Scheduler(SchedulerInterface):
         num_accepted_tokens: int,
         num_invalid_spec_tokens: dict[str, int] | None,
         request_id: str,
+        dspark_confidence: Sequence[float] | None = None,
     ) -> SpecDecodingStats | None:
         if not self.log_stats or not num_draft_tokens:
             return None
@@ -2026,7 +2046,9 @@ class Scheduler(SchedulerInterface):
         if num_invalid_spec_tokens:
             num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
         spec_decoding_stats.observe_draft(
-            num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
+            num_draft_tokens=num_draft_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            dspark_confidence=dspark_confidence,
         )
         return spec_decoding_stats
 

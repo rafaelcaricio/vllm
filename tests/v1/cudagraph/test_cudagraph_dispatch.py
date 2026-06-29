@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from tests.utils import create_new_process_for_each_test
-from vllm.compilation.cuda_graph import CUDAGraphWrapper
+from vllm.compilation.cuda_graph import CUDAGraphOptions, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import (
     CompilationConfig,
@@ -35,6 +35,25 @@ class SimpleMLP(nn.Module):
 
     def forward(self, x):
         return self.fc2(self.fc1(x))
+
+
+def test_cudagraph_wrapper_uses_explicit_graph_pool(monkeypatch):
+    sentinel_pool = object()
+    vllm_config = _create_vllm_config(CompilationConfig())
+
+    monkeypatch.setattr(
+        "vllm.compilation.cuda_graph.current_platform.get_global_graph_pool",
+        pytest.fail,
+    )
+
+    wrapper = CUDAGraphWrapper(
+        lambda: None,
+        vllm_config,
+        CUDAGraphMode.FULL,
+        cudagraph_options=CUDAGraphOptions(graph_pool=sentinel_pool),
+    )
+
+    assert wrapper.graph_pool is sentinel_pool
 
 
 def _create_vllm_config(

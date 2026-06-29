@@ -64,6 +64,8 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.FP8_PER_TOKEN_HEAD
     if kv_cache_dtype == "nvfp4":
         return KVQuantMode.NVFP4
+    if kv_cache_dtype == "nvfp4_ds_mla":
+        return KVQuantMode.NVFP4
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
     return KVQuantMode.NONE
@@ -352,6 +354,10 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.cache_dtype_str == "nvfp4_ds_mla":
+            if self.model_version == "deepseek_v4":
+                return self.storage_block_size * 584
+            return self.storage_block_size * 416
         if self.cache_dtype_str == "fp8_ds_mla":
             if self.model_version == "deepseek_v4":
                 # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.

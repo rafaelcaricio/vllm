@@ -258,6 +258,61 @@ def test_prefix_caching_for_multi_turn():
         )
 
 
+def test_async_scheduler_uses_draft_token_lengths_for_next_placeholders():
+    scheduler = object.__new__(AsyncScheduler)
+    request = create_requests(num_requests=1, num_tokens=4, max_tokens=20)[0]
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = request.num_tokens
+    request.num_output_placeholders = 1
+
+    scheduler.perf_metrics = None
+    scheduler.connector = None
+    scheduler.structured_output_manager = Mock()
+    scheduler.structured_output_manager.should_advance.return_value = False
+    scheduler.requests = {request.request_id: request}
+    scheduler.running = [request]
+    scheduler.waiting = Mock()
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.take_events.return_value = None
+    scheduler.kv_event_publisher = Mock()
+    scheduler.finished_req_ids = set()
+    scheduler.finished_req_ids_dict = None
+    scheduler.vllm_config = Mock()
+    scheduler.vllm_config.model_config.enable_return_routed_experts = False
+    scheduler.enable_return_routed_experts = False
+    scheduler.recompute_kv_load_failures = False
+    scheduler.make_stats = Mock(return_value=None)
+    scheduler.max_model_len = 128
+    scheduler.scheduler_config = Mock()
+    scheduler.scheduler_config.async_scheduling = True
+    scheduler.num_spec_tokens = 5
+
+    output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 1},
+        total_num_scheduled_tokens=1,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[123]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+        draft_token_lengths={request.request_id: 2},
+    )
+
+    scheduler.update_from_output(output, model_runner_output)
+
+    assert request.spec_token_ids == [-1, -1]
+
+
 def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler = object.__new__(AsyncScheduler)
     request = create_requests(num_requests=1, num_tokens=1)[0]

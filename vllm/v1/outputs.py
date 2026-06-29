@@ -279,6 +279,16 @@ class ModelRunnerOutput:
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
 
+    # Optional per-request draft lengths produced by async speculative
+    # proposers. Async schedulers use this to size the next placeholder list
+    # before real draft token ids are available on CPU.
+    draft_token_lengths: dict[str, int] | None = None
+
+    # Optional DSpark raw confidence rows for the draft verified in this
+    # scheduler step. Diagnostic-only: used to fit STS temperatures from
+    # confidence-vs-acceptance bins.
+    dspark_confidence: dict[str, tuple[float, ...]] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

@@ -103,6 +103,11 @@ class DeepseekV4FlashMLASparseBackend(FlashMLASparseBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        if cache_dtype_str == "nvfp4_ds_mla":
+            # Stage C long-context lane: DeepSeek V4 still uses the padded
+            # 584-byte sparse-MLA envelope. The true compact 416-byte NVFP4
+            # kernel remains a separate follow-up.
+            return (num_blocks, block_size, 584)
         if cache_dtype_str == "fp8_ds_mla":
             # DeepseekV4 main MLA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
             # head_size passed in is the semantic head_dim (512).

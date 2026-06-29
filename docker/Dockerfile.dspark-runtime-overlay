@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+FROM ghcr.io/bjk110/vllm-spark:unholy-fusion-prod-ready
+
+LABEL org.bjk110.dspark.runtime="clean-overlay" \
+      org.bjk110.dspark.reference-kv-quant-dequant="runtime-flag"
+
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        gcc \
+        libc6-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY vllm/envs.py /opt/env/lib/python3.12/site-packages/vllm/envs.py
+COPY vllm/compilation/cuda_graph.py /opt/env/lib/python3.12/site-packages/vllm/compilation/cuda_graph.py
+COPY vllm/config/cache.py /opt/env/lib/python3.12/site-packages/vllm/config/cache.py
+COPY vllm/config/speculative.py /opt/env/lib/python3.12/site-packages/vllm/config/speculative.py
+COPY vllm/utils/torch_utils.py /opt/env/lib/python3.12/site-packages/vllm/utils/torch_utils.py
+COPY vllm/model_executor/layers/fused_moe/b12x_moe.py /opt/env/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/b12x_moe.py
+COPY vllm/model_executor/warmup/kernel_warmup.py /opt/env/lib/python3.12/site-packages/vllm/model_executor/warmup/kernel_warmup.py
+COPY vllm/model_executor/models/registry.py /opt/env/lib/python3.12/site-packages/vllm/model_executor/models/registry.py
+COPY vllm/v1/outputs.py /opt/env/lib/python3.12/site-packages/vllm/v1/outputs.py
+COPY vllm/v1/kv_cache_interface.py /opt/env/lib/python3.12/site-packages/vllm/v1/kv_cache_interface.py
+COPY vllm/v1/core/sched/scheduler.py /opt/env/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py
+COPY vllm/models/deepseek_v4/__init__.py /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/__init__.py
+COPY vllm/models/deepseek_v4/attention.py /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/attention.py
+COPY vllm/models/deepseek_v4/nvidia/model.py /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/model.py
+COPY vllm/models/deepseek_v4/nvidia/sm120.py /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/sm120.py
+COPY vllm/models/deepseek_v4/nvidia/flashmla.py /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/flashmla.py
+COPY vllm/models/deepseek_v4/nvidia/dspark.py /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/dspark.py
+COPY vllm/models/deepseek_v4/nvidia/dspark_kernels.py /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/dspark_kernels.py
+COPY vllm/v1/attention/backends/registry.py /opt/env/lib/python3.12/site-packages/vllm/v1/attention/backends/registry.py
+COPY vllm/v1/attention/backends/mla/flashmla_sparse.py /opt/env/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
+COPY vllm/v1/attention/backends/mla/b12x_mla_sparse.py /opt/env/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/b12x_mla_sparse.py
+COPY vllm/v1/spec_decode/dspark.py /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py
+COPY vllm/v1/spec_decode/dspark_proposer.py /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark_proposer.py
+COPY vllm/v1/spec_decode/metrics.py /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/metrics.py
+COPY vllm/v1/worker/gpu_model_runner.py /opt/env/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py
+
+RUN /opt/env/bin/python -m py_compile \
+    /opt/env/lib/python3.12/site-packages/vllm/envs.py \
+    /opt/env/lib/python3.12/site-packages/vllm/compilation/cuda_graph.py \
+    /opt/env/lib/python3.12/site-packages/vllm/config/cache.py \
+    /opt/env/lib/python3.12/site-packages/vllm/config/speculative.py \
+    /opt/env/lib/python3.12/site-packages/vllm/utils/torch_utils.py \
+    /opt/env/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/b12x_moe.py \
+    /opt/env/lib/python3.12/site-packages/vllm/v1/kv_cache_interface.py \
+    /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/attention.py \
+    /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/model.py \
+    /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/sm120.py \
+    /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/flashmla.py \
+    /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/dspark.py \
+    /opt/env/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/dspark_kernels.py \
+    /opt/env/lib/python3.12/site-packages/vllm/v1/outputs.py \
+    /opt/env/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py \
+    /opt/env/lib/python3.12/site-packages/vllm/v1/attention/backends/registry.py \
+    /opt/env/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py \
+    /opt/env/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/b12x_mla_sparse.py \
+    /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py \
+    /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark_proposer.py \
+    /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/metrics.py \
+    /opt/env/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py
