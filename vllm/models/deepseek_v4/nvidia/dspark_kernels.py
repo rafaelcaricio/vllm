@@ -13,6 +13,7 @@ _FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 _DSPARK_MARKOV_V_BLOCK = 256
 _DSPARK_MARKOV_R_BLOCK = 32
 _DSPARK_HC_POST_H_BLOCK = 64
+_DSPARK_STORE_D_BLOCK = 64
 
 
 @triton.jit
@@ -115,6 +116,80 @@ def _dspark_quant_dequant_nope_kernel(
         kv_ptr + row * kv_stride_row + offsets * kv_stride_d,
         dequantized,
         mask=mask,
+    )
+
+
+@triton.jit
+def _dspark_store_main_kv_kernel(
+    main_kv_cache_ptr,
+    flat_kv_ptr,
+    slots_ptr,
+    rejected_ptr,
+    request_indices_ptr,
+    batch_size,
+    seq_len,
+    head_dim: tl.constexpr,
+    cache_stride_b,
+    cache_stride_s,
+    cache_stride_d,
+    flat_stride_b,
+    flat_stride_t,
+    flat_stride_d,
+    slots_stride_b,
+    slots_stride_t,
+    rejected_stride_b,
+    request_indices_stride_b,
+    HAS_REJECTED: tl.constexpr,
+    HAS_REQUEST_INDICES: tl.constexpr,
+    D_BLOCK: tl.constexpr,
+):
+    pid_bt = tl.program_id(0).to(tl.int64)
+    pid_d = tl.program_id(1).to(tl.int64)
+
+    token_idx = pid_bt % seq_len
+    batch_idx = pid_bt // seq_len
+    offs_d = pid_d * D_BLOCK + tl.arange(0, D_BLOCK)
+    valid_d = offs_d < head_dim
+
+    valid_len = seq_len
+    if HAS_REJECTED:
+        rejected = tl.load(
+            rejected_ptr + batch_idx * rejected_stride_b,
+            mask=batch_idx < batch_size,
+            other=seq_len,
+        ).to(tl.int64)
+        valid_len = seq_len - rejected
+        valid_len = tl.minimum(tl.maximum(valid_len, 0), seq_len)
+
+    store_row = batch_idx
+    if HAS_REQUEST_INDICES:
+        store_row = tl.load(
+            request_indices_ptr + batch_idx * request_indices_stride_b,
+            mask=batch_idx < batch_size,
+            other=0,
+        ).to(tl.int64)
+
+    slot = tl.load(
+        slots_ptr + batch_idx * slots_stride_b + token_idx * slots_stride_t,
+        mask=batch_idx < batch_size,
+        other=0,
+    ).to(tl.int64)
+    values = tl.load(
+        flat_kv_ptr
+        + batch_idx * flat_stride_b
+        + token_idx * flat_stride_t
+        + offs_d * flat_stride_d,
+        mask=(batch_idx < batch_size) & valid_d,
+        other=0.0,
+    )
+    should_store = (batch_idx < batch_size) & (token_idx < valid_len) & valid_d
+    tl.store(
+        main_kv_cache_ptr
+        + store_row * cache_stride_b
+        + slot * cache_stride_s
+        + offs_d * cache_stride_d,
+        values,
+        mask=should_store,
     )
 
 
@@ -672,6 +747,140 @@ def dspark_quant_dequant_nope(
         num_stages=4,
     )
     return kv
+
+
+def dspark_store_main_kv_torch(
+    main_kv_cache: torch.Tensor,
+    flat_kv: torch.Tensor,
+    slots: torch.Tensor,
+    num_rejected_tokens: torch.Tensor | None = None,
+    request_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Reference in-place DSpark main-KV cache update."""
+
+    batch_size, seq_len, head_dim = flat_kv.shape
+    if request_indices is None:
+        rows = torch.arange(batch_size, device=flat_kv.device, dtype=torch.long)
+    else:
+        rows = request_indices.to(device=flat_kv.device, dtype=torch.long).view(-1)
+        if rows.shape[0] != batch_size:
+            raise ValueError(
+                "DSpark request_indices must have one row per compact "
+                f"main-KV update; got {rows.shape[0]} indices for "
+                f"batch_size={batch_size}."
+            )
+
+    if num_rejected_tokens is None:
+        valid_lengths = torch.full(
+            (batch_size,),
+            seq_len,
+            dtype=torch.long,
+            device=flat_kv.device,
+        )
+    else:
+        rejected = num_rejected_tokens.to(
+            device=flat_kv.device,
+            dtype=torch.long,
+            non_blocking=True,
+        ).view(batch_size)
+        valid_lengths = (seq_len - rejected).clamp(min=0, max=seq_len)
+
+    for batch_idx in range(batch_size):
+        valid_len = int(valid_lengths[batch_idx].item())
+        if valid_len <= 0:
+            continue
+        row = int(rows[batch_idx].item())
+        row_slots = slots[batch_idx, :valid_len].to(torch.long)
+        main_kv_cache[row].scatter_(
+            0,
+            row_slots.view(-1, 1).expand(-1, head_dim),
+            flat_kv[batch_idx, :valid_len],
+        )
+    return main_kv_cache
+
+
+def dspark_store_main_kv(
+    main_kv_cache: torch.Tensor,
+    flat_kv: torch.Tensor,
+    slots: torch.Tensor,
+    num_rejected_tokens: torch.Tensor | None = None,
+    request_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """In-place DSpark main-KV cache update without selected-row cache copies."""
+
+    if flat_kv.ndim != 3 or slots.ndim != 2:
+        return dspark_store_main_kv_torch(
+            main_kv_cache,
+            flat_kv,
+            slots,
+            num_rejected_tokens=num_rejected_tokens,
+            request_indices=request_indices,
+        )
+    batch_size, seq_len, head_dim = flat_kv.shape
+    if slots.shape != (batch_size, seq_len):
+        return dspark_store_main_kv_torch(
+            main_kv_cache,
+            flat_kv,
+            slots,
+            num_rejected_tokens=num_rejected_tokens,
+            request_indices=request_indices,
+        )
+    if (
+        not main_kv_cache.is_cuda
+        or not flat_kv.is_cuda
+        or not slots.is_cuda
+        or not HAS_TRITON
+    ):
+        return dspark_store_main_kv_torch(
+            main_kv_cache,
+            flat_kv,
+            slots,
+            num_rejected_tokens=num_rejected_tokens,
+            request_indices=request_indices,
+        )
+    if head_dim <= 0 or seq_len <= 0:
+        return main_kv_cache
+
+    rejected = num_rejected_tokens
+    if rejected is None:
+        rejected = slots
+    elif not rejected.is_cuda:
+        rejected = rejected.to(device=flat_kv.device, non_blocking=True)
+
+    indices = request_indices
+    if indices is None:
+        indices = slots
+    elif not indices.is_cuda:
+        indices = indices.to(device=flat_kv.device, non_blocking=True)
+    indices = indices.to(dtype=torch.long)
+
+    grid = (batch_size * seq_len, triton.cdiv(head_dim, _DSPARK_STORE_D_BLOCK))
+    _dspark_store_main_kv_kernel[grid](
+        main_kv_cache,
+        flat_kv,
+        slots,
+        rejected,
+        indices,
+        batch_size,
+        seq_len,
+        head_dim,
+        main_kv_cache.stride(0),
+        main_kv_cache.stride(1),
+        main_kv_cache.stride(2),
+        flat_kv.stride(0),
+        flat_kv.stride(1),
+        flat_kv.stride(2),
+        slots.stride(0),
+        slots.stride(1),
+        rejected.stride(0),
+        indices.stride(0),
+        HAS_REJECTED=num_rejected_tokens is not None,
+        HAS_REQUEST_INDICES=request_indices is not None,
+        D_BLOCK=_DSPARK_STORE_D_BLOCK,
+        num_warps=4,
+        num_stages=4,
+    )
+    return main_kv_cache
 
 
 def dspark_sparse_attention_torch(

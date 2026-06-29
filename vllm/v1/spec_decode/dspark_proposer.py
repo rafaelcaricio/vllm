@@ -86,6 +86,13 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self._forced_draft_length = self._read_forced_draft_length(
             self.num_speculative_tokens
         )
+        self._sts_temperatures = self._read_sts_temperatures(
+            self.num_speculative_tokens
+        )
+        self._sts_temperature_tensor = self._make_sts_temperature_tensor(
+            self._sts_temperatures,
+            device,
+        )
         self._sps_curve = self._read_sps_curve()
         self._hardware_scheduler_early_stop = (
             self._read_hardware_scheduler_early_stop()
@@ -95,6 +102,12 @@ class DSparkProposer(SpecDecodeBaseProposer):
         self._export_draft_probs = self._read_export_draft_probs()
         self._collect_confidence_diagnostics = (
             self._read_collect_confidence_diagnostics()
+        )
+        self._confidence_diagnostics_log_every = (
+            self._read_confidence_diagnostics_log_every()
+        )
+        self._confidence_diagnostics_log_next = (
+            self._confidence_diagnostics_log_every
         )
         self._collect_position0_diagnostics = (
             self._read_position0_diagnostics()
@@ -127,6 +140,11 @@ class DSparkProposer(SpecDecodeBaseProposer):
                 "profiling: %d.",
                 self._forced_draft_length,
             )
+        if self._sts_temperatures:
+            logger.info(
+                "DSpark STS confidence calibration enabled with temperatures %s.",
+                self._sts_temperatures,
+            )
         if self._export_draft_probs:
             logger.info(
                 "DSpark draft probability export enabled for quality profiling. "
@@ -136,6 +154,15 @@ class DSparkProposer(SpecDecodeBaseProposer):
             logger.info(
                 "DSpark confidence diagnostics enabled. This copies confidence "
                 "scores to CPU on every draft step."
+            )
+        if (
+            self._confidence_diagnostics_log_every > 0
+            and self._should_observe_confidence()
+        ):
+            logger.info(
+                "DSpark confidence diagnostics will be logged every %d "
+                "observed draft steps.",
+                self._confidence_diagnostics_log_every,
             )
         if self._collect_position0_diagnostics:
             logger.info(
@@ -245,6 +272,57 @@ class DSparkProposer(SpecDecodeBaseProposer):
         return tuple(sorted(entries.items()))
 
     @staticmethod
+    def _read_sts_temperatures(
+        max_draft_length: int,
+    ) -> tuple[float, ...]:
+        raw = os.getenv("VLLM_DSPARK_STS_TEMPERATURES", "").strip()
+        if not raw:
+            return ()
+
+        temperatures: list[float] = []
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                temperature = float(item)
+            except ValueError as exc:
+                raise ValueError(
+                    "VLLM_DSPARK_STS_TEMPERATURES must be a comma-separated "
+                    "list of positive floats, "
+                    f"got {raw!r}"
+                ) from exc
+            if temperature <= 0.0:
+                raise ValueError(
+                    "VLLM_DSPARK_STS_TEMPERATURES values must be positive, "
+                    f"got {temperature}"
+                )
+            temperatures.append(temperature)
+
+        if not temperatures:
+            return ()
+        if len(temperatures) not in {1, int(max_draft_length)}:
+            raise ValueError(
+                "VLLM_DSPARK_STS_TEMPERATURES must contain either one "
+                f"temperature or {max_draft_length} per-position "
+                f"temperatures, got {len(temperatures)}"
+            )
+        return tuple(temperatures)
+
+    @staticmethod
+    def _make_sts_temperature_tensor(
+        temperatures: tuple[float, ...],
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if len(temperatures) <= 1:
+            return None
+        return torch.tensor(
+            temperatures,
+            dtype=torch.float32,
+            device=device,
+        ).view(1, -1)
+
+    @staticmethod
     def _read_hardware_scheduler_early_stop() -> bool:
         raw = os.getenv("VLLM_DSPARK_HARDWARE_SCHEDULER_EARLY_STOP", "1")
         return raw.strip().lower() in {"1", "true", "yes", "on"}
@@ -278,6 +356,23 @@ class DSparkProposer(SpecDecodeBaseProposer):
     def _read_collect_confidence_diagnostics() -> bool:
         raw = os.getenv("VLLM_DSPARK_COLLECT_CONFIDENCE_DIAGNOSTICS", "0")
         return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _read_confidence_diagnostics_log_every() -> int:
+        raw = os.getenv("VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY", "0")
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY must be a "
+                f"non-negative integer, got {raw!r}"
+            ) from exc
+        if value < 0:
+            raise ValueError(
+                "VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY must be "
+                f"non-negative, got {value}"
+            )
+        return value
 
     @staticmethod
     def _read_position0_diagnostics() -> bool:
@@ -360,6 +455,44 @@ class DSparkProposer(SpecDecodeBaseProposer):
             self._stage_timing_count,
             ", ".join(parts),
         )
+
+    @staticmethod
+    def _format_diagnostics_tuple(values: tuple[float, ...]) -> str:
+        return "[" + ", ".join(f"{value:.3f}" for value in values) + "]"
+
+    def _maybe_log_confidence_diagnostics(self) -> None:
+        log_every = getattr(self, "_confidence_diagnostics_log_every", 0)
+        if log_every <= 0:
+            return
+
+        snapshot = self.diagnostics.snapshot()
+        log_next = getattr(self, "_confidence_diagnostics_log_next", log_every)
+        if snapshot.num_steps < log_next:
+            return
+
+        logger.info(
+            "DSpark confidence diagnostics: steps=%d, requests=%d, "
+            "avg_scheduled_length=%.3f, prune_rate=%.3f, "
+            "expected_acceptance_length=%.3f, "
+            "expected_tokens_per_second=%.3f, scheduled_hist=%s, "
+            "avg_confidence=%s, avg_raw_confidence=%s, calibration_delta=%s, "
+            "survival=%s, scheduled_fraction=%s",
+            snapshot.num_steps,
+            snapshot.num_requests,
+            snapshot.avg_scheduled_length,
+            snapshot.draft_token_prune_rate,
+            snapshot.expected_acceptance_length,
+            snapshot.avg_expected_tokens_per_second,
+            snapshot.scheduled_length_histogram,
+            self._format_diagnostics_tuple(snapshot.avg_confidence_per_pos),
+            self._format_diagnostics_tuple(snapshot.avg_raw_confidence_per_pos),
+            self._format_diagnostics_tuple(
+                snapshot.avg_confidence_calibration_delta_per_pos
+            ),
+            self._format_diagnostics_tuple(snapshot.avg_survival_per_pos),
+            self._format_diagnostics_tuple(snapshot.scheduled_fraction_per_pos),
+        )
+        self._confidence_diagnostics_log_next = snapshot.num_steps + log_every
 
     @override
     def initialize_attn_backend(
@@ -876,6 +1009,30 @@ class DSparkProposer(SpecDecodeBaseProposer):
             device=self.device,
         )
 
+    def _calibrate_confidence(self, confidence: torch.Tensor) -> torch.Tensor:
+        temperatures = getattr(self, "_sts_temperatures", ())
+        if not temperatures or confidence.numel() == 0:
+            return confidence
+
+        confidence_f = confidence.float().clamp(1.0e-6, 1.0 - 1.0e-6)
+        logits = torch.logit(confidence_f)
+        if len(temperatures) == 1:
+            return torch.sigmoid(logits / float(temperatures[0]))
+
+        temp_tensor = getattr(self, "_sts_temperature_tensor", None)
+        if (
+            temp_tensor is None
+            or temp_tensor.device != confidence.device
+            or temp_tensor.shape[1] < confidence.shape[1]
+        ):
+            temp_tensor = self._make_sts_temperature_tensor(
+                temperatures,
+                confidence.device,
+            )
+            self._sts_temperature_tensor = temp_tensor
+        assert temp_tensor is not None
+        return torch.sigmoid(logits / temp_tensor[:, : confidence.shape[1]])
+
     def _draft_lengths_from_confidence(
         self,
         confidence_rows: list[list[float]],
@@ -929,10 +1086,24 @@ class DSparkProposer(SpecDecodeBaseProposer):
             steps_per_second=self._steps_per_second,
         )
 
-    def _observe_confidence(self, confidence: torch.Tensor) -> list[int]:
+    def _observe_confidence(
+        self,
+        confidence: torch.Tensor,
+        raw_confidence: torch.Tensor | None = None,
+    ) -> list[int]:
         confidence_rows = confidence.detach().float().cpu().tolist()
+        raw_confidence_rows = (
+            None
+            if raw_confidence is None
+            else raw_confidence.detach().float().cpu().tolist()
+        )
         schedule = self._schedule_from_confidence(confidence_rows)
-        self.diagnostics.observe(confidence_rows, schedule)
+        self.diagnostics.observe(
+            confidence_rows,
+            schedule,
+            raw_confidence_rows=raw_confidence_rows,
+        )
+        self._maybe_log_confidence_diagnostics()
         return list(schedule.lengths)
 
     def _should_observe_confidence(self) -> bool:
@@ -1104,10 +1275,14 @@ class DSparkProposer(SpecDecodeBaseProposer):
         def postprocess():
             self._maybe_store_draft_probs(draft_logits, sampling_metadata, batch_size)
             confidence_for_batch = None
+            raw_confidence_for_batch = None
             if confidence is not None and confidence.numel() > 0:
-                confidence_for_batch = confidence[
+                raw_confidence_for_batch = confidence[
                     :batch_size, : self.num_speculative_tokens
                 ]
+                confidence_for_batch = self._calibrate_confidence(
+                    raw_confidence_for_batch
+                )
                 if getattr(self, "_collect_position0_diagnostics", False):
                     self._last_confidence = confidence_for_batch.detach().clone()
             forced_length = getattr(self, "_forced_draft_length", None)
@@ -1118,7 +1293,8 @@ class DSparkProposer(SpecDecodeBaseProposer):
                 and self._should_observe_confidence()
             ):
                 self._last_draft_lengths = self._observe_confidence(
-                    confidence_for_batch
+                    confidence_for_batch,
+                    raw_confidence=raw_confidence_for_batch,
                 )
             else:
                 self._last_draft_lengths = [self.num_speculative_tokens] * batch_size

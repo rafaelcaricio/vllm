@@ -23,11 +23,21 @@ production branch.
 - The proposer now handles ragged mixed prefill+decode target batches by
   grouping requests with equal target-context lengths and issuing compact
   selected-row DSpark main-KV updates. This fixes the former uniform-reshape
-  crash and removes dummy placeholder projection work, but it is still a Python
-  grouping path that reads small query/rejection metadata on CPU and uses
-  `index_select`/`index_copy_` as a bridge. A production path should move this
-  to lower-overhead GPU-side metadata handling or a kernel-native ragged
-  main-KV update API.
+  crash and removes dummy placeholder projection work. The selected-row cache
+  write now uses a direct DSpark main-KV store kernel instead of
+  `index_select`/`index_copy_`, but the path still relies on Python grouping
+  and small CPU metadata reads. A production path should move grouping and
+  metadata handling closer to the scheduler/GPU execution layer.
+- 2026-06-29 real-model c16 A/B: direct main-KV store measured
+  `319.24 +/- 6.32` aggregate tok/s versus prior scheduler-off baseline
+  `319.37 +/- 6.72` aggregate tok/s. This removes a correctness/overhead
+  shortcut but does not move steady-state decode throughput; the bottleneck is
+  still elsewhere in verification/sparse MLA/rejection plumbing.
+- The experimental runtime overlay now installs `gcc` and `libc6-dev` because a
+  clean container could not compile Triton's launcher for the new direct-store
+  kernel. This keeps first-run JIT and container-side tests deterministic, but
+  should be revisited once kernels are fully precompiled or shipped with an
+  explicit cache.
 - The ragged mixed-batch opt-in is still named `VLLM_DSPARK_MULTI_SEQ_PAD`
   from the earlier placeholder-row implementation. It now enables ragged
   grouping rather than padding, so rename it or leave an explicit compatibility
@@ -58,12 +68,20 @@ production branch.
 - Confidence diagnostics and prefix-length decisions currently copy small
   tensors to CPU during draft observation. This is useful while bringing the
   path up, but it should be converted to an asynchronous or aggregated GPU-side
-  path before production benchmarking.
+  path before production benchmarking. Use
+  `VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY` for dedicated calibration
+  runs; keep it `0` during throughput gates.
 - Draft probabilities are not returned for probabilistic rejection sampling.
   The current path targets greedy single-stream benchmarking first.
 - Confidence scheduling consumes sigmoided probabilities today. The paper's STS
-  calibration is a temperature scaling of confidence logits; if calibration
-  scalars become available, apply them before sigmoid.
+  calibration is now available as `VLLM_DSPARK_STS_TEMPERATURES`, which
+  reconstructs confidence logits from probabilities, applies one global or
+  per-position temperature, and records raw-vs-calibrated diagnostics. The
+  optional diagnostics log now reports scheduled-length histograms, expected
+  acceptance, raw-vs-calibrated confidence, survival, and scheduled fractions.
+  Per-position temperature tensors are preallocated on proposer init. Real
+  calibration scalars still need to be fit from held-out local data before this
+  should be promoted as a default.
 - DSpark's draft model is integrated as `method="dspark"` with first-pass
   CUDA-graph key initialization and dummy-run support. This is enough for the
   real server to capture graphs, but capture metadata and logging should be
@@ -183,9 +201,16 @@ production branch.
   server: request-prep metadata, route packing, EAGLE-named speculative prep,
   and rejection greedy sampling.
 - TODO P1: replace the mixed prefill+decode Python grouping path and
-  selected-row `index_select`/`index_copy_` bridge with a kernel-native ragged
-  `prefill_main` update that preserves request row identity and avoids padding,
-  matching the paper's variable-length execution direction.
+  selected-row bridge with a scheduler/GPU-native ragged `prefill_main` update
+  that preserves request row identity and avoids Python grouping. The
+  selected-row cache write itself is now direct-kernel based; the remaining
+  overhead is grouping, compact tensor construction, and launch fragmentation.
+- DONE 2026-06-29: validate `_dspark_store_main_kv_kernel` warmup on first real
+  inference. The warmup pre-JITs no-reject, reject, request-index, and
+  reject+request-index flag combinations. A fresh server start with image
+  `sha256:dd5d0877318f32a9004f9bd9f1c23d51f4c154a841afc8a055ab070036b41a06`
+  served a first chat request without logging `_dspark_store_main_kv_kernel` or
+  any Triton JIT warning during inference on either node.
 - TODO P1: add FlashInfer sparse MLA tuning buckets for DSpark decode and graph
   capture shapes that currently fall back to tactic `-1`.
 - TODO P1: implement a fused DSpark sparse-attention kernel that combines score
@@ -222,7 +247,8 @@ production branch.
   path still has Python-level structure to collapse.
 - Near-term speed win: fuse DSpark's main-KV projection/store for the one-token
   decode path so `store_main_kv()` does not run as separate linear/norm/RoPE and
-  scatter kernels per draft layer.
+  direct-store kernels per draft layer. The selected-row cache write is now a
+  dedicated direct-store kernel, but projection and RoPE are still separate.
 - Near-term speed win: add a DSpark-specific fused input preparation kernel that
   builds draft input IDs, draft positions, and warm/cache metadata in one launch.
 - Near-term speed win: implement draft-side activation quantization in the kernel

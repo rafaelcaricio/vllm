@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_REPLICATE_MARKOV_W1: bool = False
     VLLM_DSPARK_STAGE_TIMING: bool = False
     VLLM_DSPARK_STAGE_TIMING_LOG_EVERY: int = 20
+    VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY: int = 0
     VLLM_DSPARK_ITER_TIMING: bool = False
     VLLM_DSPARK_ITER_TIMING_LOG_EVERY: int = 20
     VLLM_DSPARK_TARGET_TIMING: bool = False
@@ -1496,6 +1497,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_FORCE_DRAFT_LENGTH": lambda: os.getenv(
         "VLLM_DSPARK_FORCE_DRAFT_LENGTH", ""
     ),
+    "VLLM_DSPARK_STS_TEMPERATURES": lambda: os.getenv(
+        "VLLM_DSPARK_STS_TEMPERATURES", ""
+    ),
     "VLLM_DSPARK_EXPORT_DRAFT_PROBS": lambda: (
         os.getenv("VLLM_DSPARK_EXPORT_DRAFT_PROBS", "0").strip().lower()
         in ("1", "true", "yes", "on")
@@ -1503,6 +1507,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_COLLECT_CONFIDENCE_DIAGNOSTICS": lambda: (
         os.getenv("VLLM_DSPARK_COLLECT_CONFIDENCE_DIAGNOSTICS", "0").strip().lower()
         in ("1", "true", "yes", "on")
+    ),
+    "VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY": lambda: int(
+        os.getenv("VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY", "0")
     ),
     "VLLM_DSPARK_POSITION0_DIAGNOSTICS": lambda: (
         os.getenv("VLLM_DSPARK_POSITION0_DIAGNOSTICS", "0").strip().lower()

@@ -54,6 +54,7 @@ from .dspark_kernels import (
     dspark_markov_argmax,
     dspark_quant_dequant_nope,
     dspark_sparse_attention,
+    dspark_store_main_kv,
 )
 from .model import (
     DeepseekV4MoE,
@@ -301,8 +302,6 @@ class DeepSeekV4DSparkAttention(nn.Module):
             main_positions.reshape(batch_size * seq_len),
         ).view(batch_size, seq_len, self.head_dim)
         slots = main_positions.to(torch.long).remainder(self.window_size)
-        values = flat_kv
-        cache_rows = self.main_kv_cache[:batch_size]
         if request_indices is not None:
             request_indices = request_indices.to(
                 device=main_x.device,
@@ -315,38 +314,13 @@ class DeepSeekV4DSparkAttention(nn.Module):
                     f"main-KV update; got {request_indices.shape[0]} indices "
                     f"for batch_size={batch_size}."
                 )
-            cache_rows = self.main_kv_cache.index_select(0, request_indices)
-        if num_rejected_tokens is not None:
-            rejected = num_rejected_tokens.to(
-                device=main_x.device,
-                dtype=torch.long,
-                non_blocking=True,
-            ).view(batch_size)
-            valid_lengths = (seq_len - rejected).clamp(min=0, max=seq_len)
-            token_offsets = torch.arange(
-                seq_len,
-                device=main_x.device,
-                dtype=torch.long,
-            ).view(1, seq_len)
-            valid_mask = token_offsets < valid_lengths.view(batch_size, 1)
-            old_values = cache_rows.gather(
-                1,
-                slots.unsqueeze(-1).expand(-1, -1, self.head_dim),
-            )
-            values = torch.where(valid_mask.unsqueeze(-1), flat_kv, old_values)
-        if request_indices is None:
-            self.main_kv_cache[:batch_size].scatter_(
-                1,
-                slots.unsqueeze(-1).expand(-1, -1, self.head_dim),
-                values,
-            )
-        else:
-            updated_rows = cache_rows.scatter(
-                1,
-                slots.unsqueeze(-1).expand(-1, -1, self.head_dim),
-                values,
-            )
-            self.main_kv_cache.index_copy_(0, request_indices, updated_rows)
+        dspark_store_main_kv(
+            self.main_kv_cache,
+            flat_kv,
+            slots,
+            num_rejected_tokens=num_rejected_tokens,
+            request_indices=request_indices,
+        )
 
     def _project_q_and_draft_kv(
         self,

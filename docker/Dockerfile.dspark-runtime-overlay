@@ -7,6 +7,12 @@ FROM ghcr.io/bjk110/vllm-spark:unholy-fusion-prod-ready
 LABEL org.bjk110.dspark.runtime="clean-overlay" \
       org.bjk110.dspark.reference-kv-quant-dequant="runtime-flag"
 
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        gcc \
+        libc6-dev && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY vllm/envs.py /opt/env/lib/python3.12/site-packages/vllm/envs.py
 COPY vllm/config/speculative.py /opt/env/lib/python3.12/site-packages/vllm/config/speculative.py
 COPY vllm/model_executor/layers/fused_moe/b12x_moe.py /opt/env/lib/python3.12/site-packages/vllm/model_executor/layers/fused_moe/b12x_moe.py

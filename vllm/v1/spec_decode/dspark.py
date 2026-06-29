@@ -191,6 +191,8 @@ class DSparkDiagnosticsSnapshot:
     expected_acceptance_length: float
     avg_expected_tokens_per_second: float
     avg_confidence_per_pos: tuple[float, ...]
+    avg_raw_confidence_per_pos: tuple[float, ...]
+    avg_confidence_calibration_delta_per_pos: tuple[float, ...]
     avg_survival_per_pos: tuple[float, ...]
     scheduled_fraction_per_pos: tuple[float, ...]
 
@@ -226,6 +228,9 @@ class DSparkDiagnostics:
     scheduled_length_histogram: list[int] = field(default_factory=list)
     confidence_sums: list[float] = field(default_factory=list)
     confidence_counts: list[int] = field(default_factory=list)
+    raw_confidence_sums: list[float] = field(default_factory=list)
+    calibration_delta_sums: list[float] = field(default_factory=list)
+    calibration_counts: list[int] = field(default_factory=list)
     survival_sums: list[float] = field(default_factory=list)
     survival_counts: list[int] = field(default_factory=list)
     scheduled_counts: list[int] = field(default_factory=list)
@@ -239,6 +244,9 @@ class DSparkDiagnostics:
         self.scheduled_length_histogram = [0] * (self.max_spec_tokens + 1)
         self.confidence_sums = [0.0] * self.max_spec_tokens
         self.confidence_counts = [0] * self.max_spec_tokens
+        self.raw_confidence_sums = [0.0] * self.max_spec_tokens
+        self.calibration_delta_sums = [0.0] * self.max_spec_tokens
+        self.calibration_counts = [0] * self.max_spec_tokens
         self.survival_sums = [0.0] * self.max_spec_tokens
         self.survival_counts = [0] * self.max_spec_tokens
         self.scheduled_counts = [0] * self.max_spec_tokens
@@ -247,10 +255,17 @@ class DSparkDiagnostics:
         self,
         confidence_rows: Sequence[Sequence[float]],
         schedule_result: DSparkScheduleResult,
+        raw_confidence_rows: Sequence[Sequence[float]] | None = None,
     ) -> None:
         if len(confidence_rows) != len(schedule_result.lengths):
             raise ValueError(
                 "confidence_rows and schedule_result.lengths must have the same length"
+            )
+        if raw_confidence_rows is not None and len(raw_confidence_rows) != len(
+            confidence_rows
+        ):
+            raise ValueError(
+                "raw_confidence_rows and confidence_rows must have the same length"
             )
 
         self.num_steps += 1
@@ -270,6 +285,16 @@ class DSparkDiagnostics:
                     f"confidence_rows[{request_index}] has {len(confidences)} "
                     f"tokens, exceeding max_spec_tokens={self.max_spec_tokens}"
                 )
+            if (
+                raw_confidence_rows is not None
+                and len(raw_confidence_rows[request_index]) < len(confidences)
+            ):
+                raise ValueError(
+                    f"raw_confidence_rows[{request_index}] has "
+                    f"{len(raw_confidence_rows[request_index])} tokens, "
+                    f"fewer than confidence_rows[{request_index}] with "
+                    f"{len(confidences)} tokens"
+                )
             if scheduled_length < 0 or scheduled_length > len(confidences):
                 raise ValueError(
                     f"scheduled length {scheduled_length} is invalid for "
@@ -281,6 +306,13 @@ class DSparkDiagnostics:
             for position, confidence in enumerate(confidences):
                 self.confidence_sums[position] += float(confidence)
                 self.confidence_counts[position] += 1
+                if raw_confidence_rows is not None:
+                    raw_confidence = float(raw_confidence_rows[request_index][position])
+                    self.raw_confidence_sums[position] += raw_confidence
+                    self.calibration_delta_sums[position] += (
+                        float(confidence) - raw_confidence
+                    )
+                    self.calibration_counts[position] += 1
                 self.survival_sums[position] += survivals[position]
                 self.survival_counts[position] += 1
                 if position < scheduled_length:
@@ -290,6 +322,14 @@ class DSparkDiagnostics:
         avg_confidence_per_pos = _safe_average_tuple(
             self.confidence_sums,
             self.confidence_counts,
+        )
+        avg_raw_confidence_per_pos = _safe_average_tuple(
+            self.raw_confidence_sums,
+            self.calibration_counts,
+        )
+        avg_confidence_calibration_delta_per_pos = _safe_average_tuple(
+            self.calibration_delta_sums,
+            self.calibration_counts,
         )
         avg_survival_per_pos = _safe_average_tuple(
             self.survival_sums,
@@ -332,6 +372,10 @@ class DSparkDiagnostics:
             expected_acceptance_length=expected_acceptance_length,
             avg_expected_tokens_per_second=avg_expected_tokens_per_second,
             avg_confidence_per_pos=avg_confidence_per_pos,
+            avg_raw_confidence_per_pos=avg_raw_confidence_per_pos,
+            avg_confidence_calibration_delta_per_pos=(
+                avg_confidence_calibration_delta_per_pos
+            ),
             avg_survival_per_pos=avg_survival_per_pos,
             scheduled_fraction_per_pos=scheduled_fraction_per_pos,
         )

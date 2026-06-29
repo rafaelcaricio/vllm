@@ -1772,6 +1772,85 @@ def test_dspark_attention_store_main_kv_masks_rejected_selected_rows() -> None:
     torch.testing.assert_close(attn.main_kv_cache, expected)
 
 
+def test_dspark_store_main_kv_torch_updates_selected_rows_without_copy_bridge() -> None:
+    kernels = _dspark_kernels()
+    main_kv_cache = torch.arange(3 * 4 * 2, dtype=torch.float32).reshape(3, 4, 2)
+    original = main_kv_cache.clone()
+    flat_kv = torch.tensor(
+        [
+            [[100.0, 101.0], [102.0, 103.0], [104.0, 105.0]],
+            [[200.0, 201.0], [202.0, 203.0], [204.0, 205.0]],
+        ]
+    )
+    slots = torch.tensor([[0, 2, 3], [1, 2, 3]], dtype=torch.long)
+
+    returned = kernels.dspark_store_main_kv_torch(
+        main_kv_cache,
+        flat_kv,
+        slots,
+        num_rejected_tokens=torch.tensor([1, 2], dtype=torch.int32),
+        request_indices=torch.tensor([2, 0], dtype=torch.long),
+    )
+
+    assert returned is main_kv_cache
+    expected = original.clone()
+    expected[2, 0] = flat_kv[0, 0]
+    expected[2, 2] = flat_kv[0, 1]
+    expected[0, 1] = flat_kv[1, 0]
+    torch.testing.assert_close(main_kv_cache, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_dspark_store_main_kv_triton_matches_reference() -> None:
+    kernels = _dspark_kernels()
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(619)
+    main_kv_cache = torch.randn(
+        4,
+        8,
+        64,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    flat_kv = torch.randn(
+        3,
+        5,
+        64,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    slots = torch.tensor(
+        [[0, 2, 4, 6, 7], [1, 3, 5, 6, 7], [0, 1, 2, 3, 4]],
+        device=device,
+        dtype=torch.long,
+    )
+    rejected = torch.tensor([0, 2, 5], device=device, dtype=torch.int32)
+    request_indices = torch.tensor([3, 0, 2], device=device, dtype=torch.long)
+
+    expected = main_kv_cache.clone()
+    kernels.dspark_store_main_kv_torch(
+        expected,
+        flat_kv,
+        slots,
+        num_rejected_tokens=rejected,
+        request_indices=request_indices,
+    )
+    actual = main_kv_cache.clone()
+    returned = kernels.dspark_store_main_kv(
+        actual,
+        flat_kv,
+        slots,
+        num_rejected_tokens=rejected,
+        request_indices=request_indices,
+    )
+    torch.cuda.synchronize()
+
+    assert returned is actual
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_dspark_proposer_confidence_threshold_sets_prefix_lengths() -> None:
     proposer = DSparkProposer.__new__(DSparkProposer)
     proposer.num_speculative_tokens = 5
@@ -1795,6 +1874,123 @@ def test_dspark_proposer_confidence_threshold_sets_prefix_lengths() -> None:
     assert snapshot.num_requests == 2
     assert snapshot.num_scheduled_draft_tokens == 6
     assert snapshot.scheduled_length_histogram == (0, 1, 0, 0, 0, 1)
+
+
+def test_dspark_proposer_reads_sts_temperatures(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_DSPARK_STS_TEMPERATURES", "2.0")
+    assert DSparkProposer._read_sts_temperatures(5) == (2.0,)
+
+    monkeypatch.setenv("VLLM_DSPARK_STS_TEMPERATURES", "1, 2, 3, 4, 5")
+    assert DSparkProposer._read_sts_temperatures(5) == (1.0, 2.0, 3.0, 4.0, 5.0)
+
+    monkeypatch.setenv("VLLM_DSPARK_STS_TEMPERATURES", "1, 2")
+    with pytest.raises(ValueError, match="either one temperature or 5"):
+        DSparkProposer._read_sts_temperatures(5)
+
+    monkeypatch.setenv("VLLM_DSPARK_STS_TEMPERATURES", "0")
+    with pytest.raises(ValueError, match="positive"):
+        DSparkProposer._read_sts_temperatures(5)
+
+
+def test_dspark_proposer_calibrates_confidence_without_mutating_raw() -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer._sts_temperatures = (2.0, 0.5)
+    raw = torch.tensor([[0.80, 0.20]], dtype=torch.float32)
+
+    calibrated = DSparkProposer._calibrate_confidence(proposer, raw)
+
+    expected = torch.sigmoid(torch.logit(raw) / torch.tensor([[2.0, 0.5]]))
+    torch.testing.assert_close(calibrated, expected)
+    torch.testing.assert_close(raw, torch.tensor([[0.80, 0.20]], dtype=torch.float32))
+
+
+def test_dspark_proposer_reuses_sts_temperature_tensor() -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer._sts_temperatures = (2.0, 0.5, 1.5)
+    proposer._sts_temperature_tensor = DSparkProposer._make_sts_temperature_tensor(
+        proposer._sts_temperatures,
+        torch.device("cpu"),
+    )
+    cached = proposer._sts_temperature_tensor
+    raw = torch.tensor([[0.80, 0.20]], dtype=torch.float32)
+
+    DSparkProposer._calibrate_confidence(proposer, raw)
+
+    assert proposer._sts_temperature_tensor is cached
+
+
+def test_dspark_proposer_reports_confidence_calibration_metrics() -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.num_speculative_tokens = 2
+    proposer.confidence_threshold = 0.0
+    proposer._forced_draft_length = None
+    proposer.diagnostics = DSparkDiagnostics(max_spec_tokens=2)
+
+    lengths = DSparkProposer._observe_confidence(
+        proposer,
+        torch.tensor([[0.70, 0.30]], dtype=torch.float32),
+        raw_confidence=torch.tensor([[0.80, 0.20]], dtype=torch.float32),
+    )
+
+    assert lengths == [2]
+    snapshot = proposer.diagnostics.snapshot()
+    assert snapshot.avg_confidence_per_pos == pytest.approx((0.70, 0.30))
+    assert snapshot.avg_raw_confidence_per_pos == pytest.approx((0.80, 0.20))
+    assert snapshot.avg_confidence_calibration_delta_per_pos == pytest.approx(
+        (-0.10, 0.10)
+    )
+
+
+def test_dspark_proposer_reads_confidence_diagnostics_log_every(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY", "0")
+    assert DSparkProposer._read_confidence_diagnostics_log_every() == 0
+
+    monkeypatch.setenv("VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY", "17")
+    assert DSparkProposer._read_confidence_diagnostics_log_every() == 17
+
+    monkeypatch.setenv("VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY", "-1")
+    with pytest.raises(ValueError, match="non-negative"):
+        DSparkProposer._read_confidence_diagnostics_log_every()
+
+    monkeypatch.setenv("VLLM_DSPARK_CONFIDENCE_DIAGNOSTICS_LOG_EVERY", "bad")
+    with pytest.raises(ValueError, match="non-negative integer"):
+        DSparkProposer._read_confidence_diagnostics_log_every()
+
+
+def test_dspark_proposer_logs_confidence_diagnostics(monkeypatch) -> None:
+    proposer = DSparkProposer.__new__(DSparkProposer)
+    proposer.num_speculative_tokens = 2
+    proposer.confidence_threshold = 0.0
+    proposer.confidence_scheduler = "off"
+    proposer._forced_draft_length = None
+    proposer._sps_curve = ()
+    proposer._confidence_diagnostics_log_every = 1
+    proposer._confidence_diagnostics_log_next = 1
+    proposer.diagnostics = DSparkDiagnostics(max_spec_tokens=2)
+
+    messages: list[str] = []
+
+    def fake_info(message: str, *args) -> None:
+        messages.append(message % args)
+
+    monkeypatch.setattr(
+        "vllm.v1.spec_decode.dspark_proposer.logger.info",
+        fake_info,
+    )
+
+    lengths = DSparkProposer._observe_confidence(
+        proposer,
+        torch.tensor([[0.70, 0.30]], dtype=torch.float32),
+        raw_confidence=torch.tensor([[0.80, 0.20]], dtype=torch.float32),
+    )
+
+    assert lengths == [2]
+    log_text = "\n".join(messages)
+    assert "DSpark confidence diagnostics" in log_text
+    assert "avg_scheduled_length=2.000" in log_text
+    assert "calibration_delta=[-0.100, 0.100]" in log_text
 
 
 def test_dspark_proposer_threshold_zero_keeps_full_block() -> None:
