@@ -21,12 +21,21 @@ production branch.
   reference DSpark shape better, but it needs stronger reset/reorder handling for
   batching, preemption, and long-running mixed workloads.
 - The proposer now handles ragged mixed prefill+decode target batches by
-  grouping requests with equal target-context lengths and masking placeholder
-  rows. This fixes the former uniform-reshape crash, but it is still a Python
-  grouping path that reads small query/rejection metadata on CPU and performs
-  dummy projection work for placeholder rows. A production path should move this
-  to lower-overhead GPU-side metadata handling or a DSpark-specific ragged
+  grouping requests with equal target-context lengths and issuing compact
+  selected-row DSpark main-KV updates. This fixes the former uniform-reshape
+  crash and removes dummy placeholder projection work, but it is still a Python
+  grouping path that reads small query/rejection metadata on CPU and uses
+  `index_select`/`index_copy_` as a bridge. A production path should move this
+  to lower-overhead GPU-side metadata handling or a kernel-native ragged
   main-KV update API.
+- The ragged mixed-batch opt-in is still named `VLLM_DSPARK_MULTI_SEQ_PAD`
+  from the earlier placeholder-row implementation. It now enables ragged
+  grouping rather than padding, so rename it or leave an explicit compatibility
+  comment before this path graduates from experiment status.
+- `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1` is not part of the current
+  concurrent benchmark config. Add a clear guard before combining that GPU-mask
+  mode with ragged mixed prefill+decode batches, so future tests fail with an
+  explicit unsupported-mode message instead of a uniform-shape assertion.
 - The first post-prefill draft call warms DSpark's main-token cache from the
   prompt, then returns a synthetic draft tensor filled with the configured
   DSpark noise token. This keeps vLLM's async speculative path type-stable and
@@ -156,12 +165,17 @@ production branch.
   threshold `0.50` run reduced verified draft tokens but increased tok/s
   variance, so measure scheduler placeholder updates, ragged metadata creation,
   route packing, and rejection-sampling shape changes.
+- TODO P0: implement the paper-aligned hardware-aware prefix scheduler using a
+  profiled local SPS curve now that ragged mixed batches can preserve request
+  row identity. Compare c=4/c=8 per-user and aggregate tok/s against the
+  compact-ragged checkpoint before treating scheduler work as a win.
 - TODO P1: add warmup coverage for inference-time JIT gaps observed on the real
   server: request-prep metadata, route packing, EAGLE-named speculative prep,
   and rejection greedy sampling.
-- TODO P1: replace the mixed prefill+decode Python grouping path with a
-  kernel-native or model-native ragged `prefill_main` update that preserves
-  request row identity without full-batch placeholder rows.
+- TODO P1: replace the mixed prefill+decode Python grouping path and
+  selected-row `index_select`/`index_copy_` bridge with a kernel-native ragged
+  `prefill_main` update that preserves request row identity and avoids padding,
+  matching the paper's variable-length execution direction.
 - TODO P1: add FlashInfer sparse MLA tuning buckets for DSpark decode and graph
   capture shapes that currently fall back to tactic `-1`.
 - TODO P1: implement a fused DSpark sparse-attention kernel that combines score

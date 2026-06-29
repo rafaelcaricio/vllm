@@ -662,7 +662,14 @@ class DSparkProposer(SpecDecodeBaseProposer):
         num_rejected_tokens_gpu: torch.Tensor | None,
         batch_size: int,
     ) -> tuple[
-        list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]],
+        list[
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor | None,
+                torch.Tensor | None,
+            ]
+        ],
         torch.Tensor,
         torch.Tensor,
     ]:
@@ -719,7 +726,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
                 last_hidden = hidden_by_req[:, -1].contiguous()
                 last_positions = positions_by_req[:, -1].contiguous()
             return (
-                [(hidden_by_req, positions_by_req, rejected_for_gpu_mask)],
+                [(hidden_by_req, positions_by_req, rejected_for_gpu_mask, None)],
                 last_hidden,
                 last_positions,
             )
@@ -794,7 +801,7 @@ class DSparkProposer(SpecDecodeBaseProposer):
                 rejected_for_gpu_mask if use_gpu_rejected_mask else None
             )
             return (
-                [(hidden_by_req, positions_by_req, rejected_for_prefill)],
+                [(hidden_by_req, positions_by_req, rejected_for_prefill, None)],
                 last_hidden,
                 last_positions,
             )
@@ -811,30 +818,51 @@ class DSparkProposer(SpecDecodeBaseProposer):
             if chunk_len not in grouped_lengths:
                 grouped_lengths.append(chunk_len)
 
-        prefill_batches: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]
+        prefill_batches: list[
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor | None,
+                torch.Tensor | None,
+            ]
+        ]
         prefill_batches = []
         for group_len in grouped_lengths:
-            hidden_by_req = target_hidden_states.new_zeros(
-                batch_size,
-                group_len,
-                target_hidden_states.shape[-1],
-            )
-            positions_by_req = flat_positions.new_zeros(batch_size, group_len)
-            rejected_values = [group_len] * batch_size
-            for req_index, chunk_len in enumerate(chunk_lengths):
-                if chunk_len != group_len:
-                    continue
-                hidden_by_req[req_index].copy_(hidden_chunks[req_index])
-                positions_by_req[req_index].copy_(position_chunks[req_index])
-                rejected_values[req_index] = prefill_rejected_counts[req_index]
-
-            rejected_for_prefill = torch.tensor(
-                rejected_values,
-                dtype=torch.int32,
+            group_indices = [
+                req_index
+                for req_index, chunk_len in enumerate(chunk_lengths)
+                if chunk_len == group_len
+            ]
+            hidden_by_req = torch.stack(
+                [hidden_chunks[req_index] for req_index in group_indices],
+                dim=0,
+            ).contiguous()
+            positions_by_req = torch.stack(
+                [position_chunks[req_index] for req_index in group_indices],
+                dim=0,
+            ).contiguous()
+            rejected_values = [
+                prefill_rejected_counts[req_index] for req_index in group_indices
+            ]
+            rejected_for_prefill = None
+            if any(rejected_values):
+                rejected_for_prefill = torch.tensor(
+                    rejected_values,
+                    dtype=torch.int32,
+                    device=target_hidden_states.device,
+                )
+            request_indices = torch.tensor(
+                group_indices,
+                dtype=torch.long,
                 device=target_hidden_states.device,
             )
             prefill_batches.append(
-                (hidden_by_req, positions_by_req, rejected_for_prefill)
+                (
+                    hidden_by_req,
+                    positions_by_req,
+                    rejected_for_prefill,
+                    request_indices,
+                )
             )
 
         return prefill_batches, last_hidden, last_positions
@@ -1007,12 +1035,25 @@ class DSparkProposer(SpecDecodeBaseProposer):
         ) = self._timed_stage("context_prepare", prepare_context)
 
         def prefill_main():
-            for hidden_by_req, positions_by_req, num_rejected in prefill_batches:
-                self.model.prefill_main(
-                    hidden_by_req,
-                    positions_by_req,
-                    num_rejected_tokens=num_rejected,
-                )
+            for (
+                hidden_by_req,
+                positions_by_req,
+                num_rejected,
+                request_indices,
+            ) in prefill_batches:
+                if request_indices is None:
+                    self.model.prefill_main(
+                        hidden_by_req,
+                        positions_by_req,
+                        num_rejected_tokens=num_rejected,
+                    )
+                else:
+                    self.model.prefill_main(
+                        hidden_by_req,
+                        positions_by_req,
+                        num_rejected_tokens=num_rejected,
+                        request_indices=request_indices,
+                    )
 
         self._timed_stage(
             "prefill_main",

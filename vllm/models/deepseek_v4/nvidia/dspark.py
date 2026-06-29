@@ -290,6 +290,7 @@ class DeepSeekV4DSparkAttention(nn.Module):
         main_x: torch.Tensor,
         main_positions: torch.Tensor,
         num_rejected_tokens: torch.Tensor | None = None,
+        request_indices: torch.Tensor | None = None,
     ) -> None:
         if main_x.shape[1] > self.window_size:
             main_x = main_x[:, -self.window_size :]
@@ -301,6 +302,20 @@ class DeepSeekV4DSparkAttention(nn.Module):
         ).view(batch_size, seq_len, self.head_dim)
         slots = main_positions.to(torch.long).remainder(self.window_size)
         values = flat_kv
+        cache_rows = self.main_kv_cache[:batch_size]
+        if request_indices is not None:
+            request_indices = request_indices.to(
+                device=main_x.device,
+                dtype=torch.long,
+                non_blocking=True,
+            ).view(-1)
+            if request_indices.shape[0] != batch_size:
+                raise ValueError(
+                    "DSpark request_indices must have one row per compact "
+                    f"main-KV update; got {request_indices.shape[0]} indices "
+                    f"for batch_size={batch_size}."
+                )
+            cache_rows = self.main_kv_cache.index_select(0, request_indices)
         if num_rejected_tokens is not None:
             rejected = num_rejected_tokens.to(
                 device=main_x.device,
@@ -314,16 +329,24 @@ class DeepSeekV4DSparkAttention(nn.Module):
                 dtype=torch.long,
             ).view(1, seq_len)
             valid_mask = token_offsets < valid_lengths.view(batch_size, 1)
-            old_values = self.main_kv_cache[:batch_size].gather(
+            old_values = cache_rows.gather(
                 1,
                 slots.unsqueeze(-1).expand(-1, -1, self.head_dim),
             )
             values = torch.where(valid_mask.unsqueeze(-1), flat_kv, old_values)
-        self.main_kv_cache[:batch_size].scatter_(
-            1,
-            slots.unsqueeze(-1).expand(-1, -1, self.head_dim),
-            values,
-        )
+        if request_indices is None:
+            self.main_kv_cache[:batch_size].scatter_(
+                1,
+                slots.unsqueeze(-1).expand(-1, -1, self.head_dim),
+                values,
+            )
+        else:
+            updated_rows = cache_rows.scatter(
+                1,
+                slots.unsqueeze(-1).expand(-1, -1, self.head_dim),
+                values,
+            )
+            self.main_kv_cache.index_copy_(0, request_indices, updated_rows)
 
     def _project_q_and_draft_kv(
         self,
@@ -706,6 +729,7 @@ class DeepSeekV4DSparkModel(nn.Module):
         main_hidden: torch.Tensor,
         main_positions: torch.Tensor,
         num_rejected_tokens: torch.Tensor | None = None,
+        request_indices: torch.Tensor | None = None,
     ) -> None:
         main_x = self.project_main(main_hidden.reshape(-1, main_hidden.shape[-1]))
         main_x = main_x.view(*main_hidden.shape[:-1], self.config.hidden_size)
@@ -714,6 +738,7 @@ class DeepSeekV4DSparkModel(nn.Module):
                 main_x,
                 main_positions,
                 num_rejected_tokens=num_rejected_tokens,
+                request_indices=request_indices,
             )
 
     def draft(
@@ -873,11 +898,13 @@ class DeepSeekV4DSpark(nn.Module):
         main_hidden: torch.Tensor,
         main_positions: torch.Tensor,
         num_rejected_tokens: torch.Tensor | None = None,
+        request_indices: torch.Tensor | None = None,
     ) -> None:
         self.model.prefill_main(
             main_hidden,
             main_positions,
             num_rejected_tokens=num_rejected_tokens,
+            request_indices=request_indices,
         )
 
     def draft(

@@ -1398,7 +1398,9 @@ def test_dspark_proposer_gpu_mask_anchors_on_last_non_rejected_token(
         def __exit__(self, *_args: object) -> None:
             return None
 
-    captured_prefill: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = []
+    captured_prefill: list[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]
+    ] = []
     captured_draft: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     class FakeDSparkModel:
@@ -1408,12 +1410,14 @@ def test_dspark_proposer_gpu_mask_anchors_on_last_non_rejected_token(
             positions_by_req: torch.Tensor,
             *,
             num_rejected_tokens: torch.Tensor | None = None,
+            request_indices: torch.Tensor | None = None,
         ) -> None:
             captured_prefill.append(
                 (
                     hidden_by_req.detach().clone(),
                     positions_by_req.detach().clone(),
                     num_rejected_tokens,
+                    request_indices,
                 )
             )
 
@@ -1495,10 +1499,13 @@ def test_dspark_proposer_gpu_mask_anchors_on_last_non_rejected_token(
     )
 
     assert len(captured_prefill) == 1
-    prefill_hidden, prefill_positions, prefill_rejected = captured_prefill[0]
+    prefill_hidden, prefill_positions, prefill_rejected, prefill_indices = (
+        captured_prefill[0]
+    )
     torch.testing.assert_close(prefill_hidden, hidden.view(1, 4, 3))
     torch.testing.assert_close(prefill_positions, positions.view(1, 4))
     assert prefill_rejected is rejected
+    assert prefill_indices is None
 
     assert len(captured_draft) == 1
     draft_hidden, draft_positions = captured_draft[0]
@@ -1514,7 +1521,7 @@ def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
     import vllm.v1.spec_decode.dspark_proposer as dspark_proposer_module
 
     class AttentionMetadataStub:
-        query_start_loc_cpu = torch.tensor([0, 415, 421], dtype=torch.int32)
+        query_start_loc_cpu = torch.tensor([0, 415, 421, 836], dtype=torch.int32)
         query_start_loc = query_start_loc_cpu
 
     class FakeForwardContext:
@@ -1524,7 +1531,9 @@ def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
         def __exit__(self, *_args: object) -> None:
             return None
 
-    captured_prefill: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = []
+    captured_prefill: list[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]
+    ] = []
     captured_draft: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     class FakeDSparkModel:
@@ -1534,6 +1543,7 @@ def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
             positions_by_req: torch.Tensor,
             *,
             num_rejected_tokens: torch.Tensor | None = None,
+            request_indices: torch.Tensor | None = None,
         ) -> None:
             captured_prefill.append(
                 (
@@ -1542,6 +1552,9 @@ def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
                     None
                     if num_rejected_tokens is None
                     else num_rejected_tokens.detach().clone(),
+                    None
+                    if request_indices is None
+                    else request_indices.detach().clone(),
                 )
             )
 
@@ -1577,9 +1590,9 @@ def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
         DSparkProposer,
         "_run_draft_for_current_context",
         lambda _self: (
-            torch.full((2, 5), 9, dtype=torch.long),
+            torch.full((3, 5), 9, dtype=torch.long),
             torch.empty(0, 0, 0),
-            torch.empty(2, 0),
+            torch.empty(3, 0),
         ),
     )
 
@@ -1599,51 +1612,59 @@ def test_dspark_proposer_groups_mixed_prefill_and_decode_context(
     proposer._prefilled = True
     proposer.model = FakeDSparkModel()
 
-    hidden = torch.arange(421 * 3, dtype=torch.float32).reshape(421, 3)
+    hidden = torch.arange(836 * 3, dtype=torch.float32).reshape(836, 3)
     positions = torch.cat(
         [
             torch.arange(415, dtype=torch.long),
             torch.arange(669, 675, dtype=torch.long),
+            torch.arange(900, 1315, dtype=torch.long),
         ]
     )
 
     draft_ids = DSparkProposer.propose(
         proposer,
-        target_token_ids=torch.empty(2, dtype=torch.long),
+        target_token_ids=torch.empty(3, dtype=torch.long),
         target_positions=positions,
         target_hidden_states=hidden,
-        next_token_ids=torch.tensor([21, 22], dtype=torch.int32),
+        next_token_ids=torch.tensor([21, 22, 23], dtype=torch.int32),
         token_indices_to_sample=None,
         common_attn_metadata=AttentionMetadataStub(),  # type: ignore[arg-type]
         sampling_metadata=None,  # type: ignore[arg-type]
-        num_rejected_tokens_gpu=torch.tensor([0, 0], dtype=torch.int32),
+        num_rejected_tokens_gpu=torch.tensor([0, 0, 0], dtype=torch.int32),
     )
 
     assert len(captured_prefill) == 2
-    long_hidden, long_positions, long_rejected = captured_prefill[0]
+    long_hidden, long_positions, long_rejected, long_indices = captured_prefill[0]
     assert long_hidden.shape == (2, 415, 3)
     torch.testing.assert_close(long_hidden[0], hidden[:415])
-    torch.testing.assert_close(long_hidden[1], torch.zeros_like(long_hidden[1]))
+    torch.testing.assert_close(long_hidden[1], hidden[421:836])
     torch.testing.assert_close(long_positions[0], positions[:415])
-    torch.testing.assert_close(long_positions[1], torch.zeros_like(long_positions[1]))
-    assert long_rejected is not None
-    assert long_rejected.tolist() == [0, 415]
+    torch.testing.assert_close(long_positions[1], positions[421:836])
+    assert long_rejected is None
+    assert long_indices is not None
+    assert long_indices.tolist() == [0, 2]
 
-    short_hidden, short_positions, short_rejected = captured_prefill[1]
-    assert short_hidden.shape == (2, 6, 3)
-    torch.testing.assert_close(short_hidden[0], torch.zeros_like(short_hidden[0]))
-    torch.testing.assert_close(short_hidden[1], hidden[415:421])
-    torch.testing.assert_close(short_positions[0], torch.zeros_like(short_positions[0]))
-    torch.testing.assert_close(short_positions[1], positions[415:421])
-    assert short_rejected is not None
-    assert short_rejected.tolist() == [6, 0]
+    short_hidden, short_positions, short_rejected, short_indices = captured_prefill[1]
+    assert short_hidden.shape == (1, 6, 3)
+    torch.testing.assert_close(short_hidden[0], hidden[415:421])
+    torch.testing.assert_close(short_positions[0], positions[415:421])
+    assert short_rejected is None
+    assert short_indices is not None
+    assert short_indices.tolist() == [1]
 
     assert len(captured_draft) == 1
     draft_hidden, draft_positions = captured_draft[0]
-    torch.testing.assert_close(draft_hidden, torch.stack([hidden[414], hidden[420]]))
-    torch.testing.assert_close(draft_positions, torch.tensor([414, 674]))
-    assert draft_ids.tolist() == [[9, 9, 9, 9, 9], [9, 9, 9, 9, 9]]
-    assert DSparkProposer.take_last_draft_lengths(proposer) == [5, 5]
+    torch.testing.assert_close(
+        draft_hidden,
+        torch.stack([hidden[414], hidden[420], hidden[835]]),
+    )
+    torch.testing.assert_close(draft_positions, torch.tensor([414, 674, 1314]))
+    assert draft_ids.tolist() == [
+        [9, 9, 9, 9, 9],
+        [9, 9, 9, 9, 9],
+        [9, 9, 9, 9, 9],
+    ]
+    assert DSparkProposer.take_last_draft_lengths(proposer) == [5, 5, 5]
 
 
 def test_dspark_attention_store_main_kv_can_skip_fully_masked_rows() -> None:
@@ -1676,6 +1697,78 @@ def test_dspark_attention_store_main_kv_can_skip_fully_masked_rows() -> None:
 
     expected = original_cache.clone()
     expected[0, 0:3] = main_x[0]
+    torch.testing.assert_close(attn.main_kv_cache, expected)
+
+
+def test_dspark_attention_store_main_kv_can_update_selected_rows() -> None:
+    dspark_module = _dspark_model_module()
+    attn = dspark_module.DeepSeekV4DSparkAttention.__new__(
+        dspark_module.DeepSeekV4DSparkAttention
+    )
+    torch.nn.Module.__init__(attn)
+    attn.window_size = 4
+    attn.hidden_size = 2
+    attn.head_dim = 2
+    original_cache = torch.arange(3 * 4 * 2, dtype=torch.float32).reshape(3, 4, 2)
+    attn.main_kv_cache = original_cache.clone()
+    attn._project_kv = lambda hidden_states, _positions: hidden_states
+
+    main_x = torch.tensor(
+        [
+            [[100.0, 101.0], [102.0, 103.0]],
+            [[200.0, 201.0], [202.0, 203.0]],
+        ]
+    )
+    main_positions = torch.tensor([[0, 2], [1, 3]], dtype=torch.long)
+
+    dspark_module.DeepSeekV4DSparkAttention.store_main_kv(
+        attn,
+        main_x,
+        main_positions,
+        request_indices=torch.tensor([2, 0], dtype=torch.long),
+    )
+
+    expected = original_cache.clone()
+    expected[2, 0] = main_x[0, 0]
+    expected[2, 2] = main_x[0, 1]
+    expected[0, 1] = main_x[1, 0]
+    expected[0, 3] = main_x[1, 1]
+    torch.testing.assert_close(attn.main_kv_cache, expected)
+
+
+def test_dspark_attention_store_main_kv_masks_rejected_selected_rows() -> None:
+    dspark_module = _dspark_model_module()
+    attn = dspark_module.DeepSeekV4DSparkAttention.__new__(
+        dspark_module.DeepSeekV4DSparkAttention
+    )
+    torch.nn.Module.__init__(attn)
+    attn.window_size = 4
+    attn.hidden_size = 2
+    attn.head_dim = 2
+    original_cache = torch.arange(3 * 4 * 2, dtype=torch.float32).reshape(3, 4, 2)
+    attn.main_kv_cache = original_cache.clone()
+    attn._project_kv = lambda hidden_states, _positions: hidden_states
+
+    main_x = torch.tensor(
+        [
+            [[100.0, 101.0], [102.0, 103.0], [104.0, 105.0]],
+            [[200.0, 201.0], [202.0, 203.0], [204.0, 205.0]],
+        ]
+    )
+    main_positions = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.long)
+
+    dspark_module.DeepSeekV4DSparkAttention.store_main_kv(
+        attn,
+        main_x,
+        main_positions,
+        num_rejected_tokens=torch.tensor([1, 2], dtype=torch.int32),
+        request_indices=torch.tensor([2, 0], dtype=torch.long),
+    )
+
+    expected = original_cache.clone()
+    expected[2, 0] = main_x[0, 0]
+    expected[2, 1] = main_x[0, 1]
+    expected[0, 1] = main_x[1, 0]
     torch.testing.assert_close(attn.main_kv_cache, expected)
 
 
